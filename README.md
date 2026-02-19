@@ -1,12 +1,12 @@
-# Move Anything Virus
+# Move Everything: Virus
 
-Access Virus synthesizer emulation for [Move Anything](https://github.com/charlesvestal/move-anything) on Ableton Move hardware.
+Access Virus synthesizer emulation for [Move Everything](https://github.com/charlesvestal/move-anything) on Ableton Move hardware.
 
 Uses the [Gearmulator](https://github.com/dsp56300/gearmulator) DSP56300 JIT emulator to run the original Virus firmware.
 
 ## Requirements
 
-- Move Anything host installed on your Ableton Move
+- Move Everything host installed on your Ableton Move
 - A Virus ROM file (`.bin` or `.mid` format) — not included
 
 ## Installation
@@ -40,7 +40,7 @@ The DSP56300 JIT compiler translates Motorola DSP56300 instructions to ARM64 (aa
 
 ## Signal Chain Integration
 
-Works as a sound generator in Move Anything's Signal Chain. Exposed parameters:
+Works as a sound generator in Move Everything's Signal Chain. Exposed parameters:
 
 - Filter: Cutoff, Resonance, Filter Env Amount, Filter Mode
 - Filter Envelope: Attack, Decay, Sustain, Release
