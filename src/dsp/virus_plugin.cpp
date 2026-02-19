@@ -147,23 +147,25 @@ struct virus_param_t {
     int max_val;
 };
 
+/* Virus Page A CC numbers (from parameterDescriptions_C.json cc-to-param map).
+ * These are NOT standard MIDI CCs — they're the Virus's own parameter indices. */
 static const virus_param_t g_params[] = {
-    {"cutoff",       "Cutoff",        74, 0, 127},
-    {"resonance",    "Resonance",     71, 0, 127},
-    {"filter_env",   "Filter Env",    77, 0, 127},
-    {"attack",       "Attack",        73, 0, 127},
-    {"decay",        "Decay",         75, 0, 127},
-    {"sustain",      "Sustain",       76, 0, 127},
-    {"release",      "Release",       72, 0, 127},
-    {"filter_type",  "Filter Type",   68, 0, 127},
-    {"osc1_shape",   "Osc1 Shape",    69, 0, 127},
-    {"osc2_shape",   "Osc2 Shape",    70, 0, 127},
-    {"osc_balance",  "Osc Balance",   21, 0, 127},
-    {"chorus_mix",   "Chorus Mix",    93, 0, 127},
-    {"delay_time",   "Delay Time",    89, 0, 127},
-    {"delay_fb",     "Delay FB",      90, 0, 127},
-    {"reverb_mix",   "Reverb Mix",    91, 0, 127},
-    {"lfo1_rate",    "LFO1 Rate",     67, 0, 127},
+    {"cutoff",       "Cutoff",        40, 0, 127},
+    {"resonance",    "Resonance",     42, 0, 127},
+    {"filter_env",   "Filt Env Amt",  44, 0, 127},
+    {"flt_attack",   "Flt Attack",    54, 0, 127},
+    {"flt_decay",    "Flt Decay",     55, 0, 127},
+    {"flt_sustain",  "Flt Sustain",   56, 0, 127},
+    {"flt_release",  "Flt Release",   58, 0, 127},
+    {"amp_attack",   "Amp Attack",    59, 0, 127},
+    {"amp_decay",    "Amp Decay",     60, 0, 127},
+    {"amp_sustain",  "Amp Sustain",   61, 0, 127},
+    {"amp_release",  "Amp Release",   63, 0, 127},
+    {"filter_mode",  "Filter Mode",   51, 0, 7},
+    {"osc1_shape",   "Osc1 Shape",    17, 0, 127},
+    {"osc2_shape",   "Osc2 Shape",    22, 0, 127},
+    {"osc_balance",  "Osc Balance",   33, 0, 127},
+    {"patch_volume", "Volume",        91, 0, 127},
 };
 static const int NUM_PARAMS = sizeof(g_params) / sizeof(g_params[0]);
 
@@ -669,11 +671,10 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     memset(inst->shm, 0, sizeof(virus_shm_t));
     strncpy((char*)inst->shm->module_dir, module_dir, sizeof(inst->shm->module_dir) - 1);
 
-    /* Set default CC values */
-    inst->shm->cc_values[74] = 127;
-    inst->shm->cc_values[75] = 64;
-    inst->shm->cc_values[76] = 64;
-    inst->shm->cc_values[72] = 64;
+    /* Set default CC values (Virus Page A indices) */
+    inst->shm->cc_values[40] = 127;  /* Cutoff */
+    inst->shm->cc_values[42] = 0;    /* Resonance */
+    inst->shm->cc_values[91] = 100;  /* Patch Volume */
 
     fprintf(stderr, "Virus: creating instance from %s (fork mode)\n", module_dir);
     snprintf((char*)inst->shm->loading_status, sizeof(inst->shm->loading_status), "Initializing...");
@@ -888,7 +889,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return off;
     }
     if (strcmp(key, "ui_hierarchy") == 0) {
-        const char *h = "{\"modes\":null,\"levels\":{\"root\":{\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\",\"children\":null,\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"attack\",\"decay\",\"sustain\",\"release\",\"octave_transpose\"],\"params\":[{\"level\":\"filter\",\"label\":\"Filter\"},{\"level\":\"osc\",\"label\":\"Oscillators\"},{\"level\":\"fx\",\"label\":\"Effects\"}]},\"filter\":{\"children\":null,\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_type\"],\"params\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_type\"]},\"osc\":{\"children\":null,\"knobs\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\"],\"params\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\"]},\"fx\":{\"children\":null,\"knobs\":[\"chorus_mix\",\"delay_time\",\"delay_fb\",\"reverb_mix\"],\"params\":[\"chorus_mix\",\"delay_time\",\"delay_fb\",\"reverb_mix\"]}}}";
+        const char *h = "{\"modes\":null,\"levels\":{\"root\":{\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\",\"children\":null,"
+            "\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"flt_attack\",\"flt_decay\",\"flt_sustain\",\"flt_release\",\"octave_transpose\"],"
+            "\"params\":[{\"level\":\"filter\",\"label\":\"Filter\"},{\"level\":\"amp\",\"label\":\"Amp Env\"},{\"level\":\"osc\",\"label\":\"Oscillators\"}]},"
+            "\"filter\":{\"children\":null,\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_mode\"],\"params\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_mode\"]},"
+            "\"amp\":{\"children\":null,\"knobs\":[\"amp_attack\",\"amp_decay\",\"amp_sustain\",\"amp_release\"],\"params\":[\"amp_attack\",\"amp_decay\",\"amp_sustain\",\"amp_release\"]},"
+            "\"osc\":{\"children\":null,\"knobs\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"],\"params\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"]}}}";
         int len = strlen(h);
         if (len < buf_len) { strcpy(buf, h); return len; }
         return -1;
