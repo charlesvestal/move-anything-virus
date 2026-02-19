@@ -317,11 +317,29 @@ static void child_update_preset_name(virus_shm_t *shm, virusLib::ROMFile *rom) {
         snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "---");
 }
 
+static virus_shm_t *g_child_shm = nullptr;
+
+static void child_crash_handler(int sig) {
+    /* Write crash info to debug log before dying */
+    FILE *f = fopen("/data/UserData/move-anything/virus_debug.log", "a");
+    if (f) {
+        fprintf(f, "[child] CRASHED signal=%d (%s) pid=%d\n",
+                sig, sig == 11 ? "SIGSEGV" : sig == 7 ? "SIGBUS" : sig == 6 ? "SIGABRT" : "?",
+                (int)getpid());
+        fflush(f);
+        fclose(f);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 static void child_main(virus_shm_t *shm) {
-    /* We're in the child process now. Reset signal handlers. */
-    signal(SIGSEGV, SIG_DFL);
-    signal(SIGBUS, SIG_DFL);
-    signal(SIGABRT, SIG_DFL);
+    g_child_shm = shm;
+
+    /* Install crash handler so we get diagnostics */
+    signal(SIGSEGV, child_crash_handler);
+    signal(SIGBUS, child_crash_handler);
+    signal(SIGABRT, child_crash_handler);
 
     /* Close the vlog FILE from parent (we'll reopen) */
     if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
