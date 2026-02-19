@@ -97,6 +97,7 @@ typedef struct plugin_api_v2 {
 #define EMU_CHUNK           64
 #define OUTPUT_GAIN         1.0f
 #define MIDI_FIFO_SIZE      4096  /* bytes */
+#define RING_TARGET_FILL    384   /* ~8.7ms at 44100 Hz — low latency but enough buffer */
 
 static const host_api_v1_t *g_host = nullptr;
 
@@ -488,9 +489,9 @@ static void child_main(virus_shm_t *shm) {
             /* Process incoming MIDI from parent */
             child_process_midi_fifo(shm, mc);
 
-            /* Wait for ring buffer space */
-            if (shm_ring_free(shm) < RESAMPLE_MAX_OUT) {
-                usleep(200);
+            /* Throttle: don't let ring fill beyond target (keeps latency low) */
+            if (shm_ring_available(shm) >= RING_TARGET_FILL) {
+                usleep(500);
                 continue;
             }
 
