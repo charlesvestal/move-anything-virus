@@ -1,6 +1,6 @@
-# Move Everything: Virus
+# Move Everything: Osirus
 
-Access Virus synthesizer emulation for [Move Everything](https://github.com/charlesvestal/move-anything) on Ableton Move hardware.
+Access Virus synthesizer emulation for [Move Everything](https://github.com/charlesvestal/move-anything) on Ableton Move hardware. Named "Osirus" after [Gearmulator's Virus emulation](https://github.com/dsp56300/gearmulator).
 
 Uses the [Gearmulator](https://github.com/dsp56300/gearmulator) DSP56300 JIT emulator to run the original Virus firmware.
 
@@ -20,7 +20,7 @@ Install via the Module Store on your Move, or manually:
 
 Then place your Virus ROM file in the module's `roms/` directory on the device:
 ```
-/data/UserData/move-anything/modules/sound_generators/virus/roms/
+/data/UserData/move-anything/modules/sound_generators/osirus/roms/
 ```
 
 ## Supported ROMs
@@ -58,7 +58,7 @@ Requires Docker for cross-compilation:
 ./scripts/build.sh    # Build via Docker (Ubuntu 22.04 + aarch64 toolchain)
 ```
 
-Output: `dist/virus/dsp.so` (ARM64 shared library)
+Output: `dist/osirus/dsp.so` (ARM64 shared library)
 
 ## Credits
 

@@ -1,5 +1,5 @@
 /*
- * Virus UI for Move Anything
+ * Osirus UI for Move Everything
  *
  * Uses shared sound generator UI base for consistent preset browsing.
  * Parameter editing via shadow UI hierarchy when in chain context.
@@ -10,7 +10,7 @@ import { createSoundGeneratorUI } from '/data/UserData/move-anything/shared/soun
 
 /* Create the UI with Virus-specific customizations */
 const ui = createSoundGeneratorUI({
-    moduleName: 'Virus',
+    moduleName: 'Osirus',
 
     onInit: (state) => {
         /* Virus-specific initialization */

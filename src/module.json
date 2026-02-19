@@ -1,8 +1,8 @@
 {
-    "id": "virus",
-    "name": "Virus",
-    "abbrev": "VR",
-    "version": "0.1.3",
+    "id": "osirus",
+    "name": "Osirus",
+    "abbrev": "OS",
+    "version": "0.2.0",
     "description": "Access Virus DSP56300 emulator (Gearmulator)",
     "author": "dsp56300/gearmulator (port: charlesvestal)",
     "ui": "ui.js",

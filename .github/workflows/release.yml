@@ -33,13 +33,13 @@ jobs:
 
       - name: Build with Docker
         run: |
-          docker build -t virus-builder -f scripts/Dockerfile .
-          docker run --rm -v "$PWD:/build" -w /build virus-builder ./scripts/build.sh
+          docker build -t osirus-builder -f scripts/Dockerfile .
+          docker run --rm -v "$PWD:/build" -w /build osirus-builder ./scripts/build.sh
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/virus-module.tar.gz
+          files: dist/osirus-module.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -55,7 +55,7 @@ jobs:
           cat > release.json << EOF
           {
             "version": "${VERSION}",
-            "download_url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/virus-module.tar.gz"
+            "download_url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/osirus-module.tar.gz"
           }
           EOF
 

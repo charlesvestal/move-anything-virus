@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Virus module for Move Anything (ARM64)
+# Build Osirus module for Move Everything (ARM64)
 #
 # Uses CMake to build the gearmulator Virus library and plugin wrapper.
 # Automatically uses Docker for cross-compilation if needed.
@@ -11,7 +11,7 @@ IMAGE_NAME="move-anything-virus-builder"
 
 # Check if we need Docker
 if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
-    echo "=== Virus Module Build (via Docker) ==="
+    echo "=== Osirus Module Build (via Docker) ==="
     echo ""
 
     # Build Docker image if needed
@@ -38,7 +38,7 @@ fi
 # === Actual build (runs in Docker or with cross-compiler) ===
 cd "$REPO_ROOT"
 
-echo "=== Building Virus Module ==="
+echo "=== Building Osirus Module ==="
 
 # Create build directory
 mkdir -p build
@@ -57,29 +57,29 @@ cmake --build build --target virus-move-plugin -j$(nproc) 2>&1
 
 # Package
 echo "Packaging..."
-mkdir -p dist/virus
+mkdir -p dist/osirus
 
 # Copy files to dist
-cat src/module.json > dist/virus/module.json
-cat src/ui.js > dist/virus/ui.js
-cat build/dsp.so > dist/virus/dsp.so
-chmod +x dist/virus/dsp.so
+cat src/module.json > dist/osirus/module.json
+cat src/ui.js > dist/osirus/ui.js
+cat build/dsp.so > dist/osirus/dsp.so
+chmod +x dist/osirus/dsp.so
 
 # Create roms directory placeholder
-mkdir -p dist/virus/roms
+mkdir -p dist/osirus/roms
 
 # Create tarball for release
 cd dist
-tar -czvf virus-module.tar.gz virus/
+tar -czvf osirus-module.tar.gz osirus/
 cd ..
 
 echo ""
 echo "=== Build Complete ==="
-echo "Output: dist/virus/"
-echo "Tarball: dist/virus-module.tar.gz"
+echo "Output: dist/osirus/"
+echo "Tarball: dist/osirus-module.tar.gz"
 echo ""
 echo "To install on Move:"
 echo "  ./scripts/install.sh"
 echo ""
-echo "IMPORTANT: Place a Virus B/C ROM file (.bin) in the roms/ directory on device:"
-echo "  /data/UserData/move-anything/modules/sound_generators/virus/roms/"
+echo "IMPORTANT: Place a Virus A ROM file (.mid) in the roms/ directory on device:"
+echo "  /data/UserData/move-anything/modules/sound_generators/osirus/roms/"
