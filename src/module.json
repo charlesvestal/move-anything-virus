@@ -11,9 +11,9 @@
     "assets": {
         "path": "roms",
         "label": "ROMs",
-        "extensions": [".bin", ".mid"],
-        "description": "Requires an Access Virus ROM file. Supports Virus A (.mid), B, or C (.bin) firmware.",
-        "hint": "Upload a Virus ROM file. Virus A uses .mid boot ROM format, Virus B/C uses .bin firmware format.",
+        "extensions": [".mid"],
+        "description": "Requires a Virus A ROM file (.mid format). Virus B/C are not supported on Move hardware.",
+        "hint": "Upload a Virus A ROM file (.mid boot ROM format). Virus B/C ROMs require too much DSP power for Move.",
         "hint_url": "https://github.com/charlesvestal/move-anything-virus",
         "hint_url_label": "Read more"
     },

@@ -7,7 +7,7 @@ Uses the [Gearmulator](https://github.com/dsp56300/gearmulator) DSP56300 JIT emu
 ## Requirements
 
 - Move Everything host installed on your Ableton Move
-- A Virus ROM file (`.bin` or `.mid` format) — not included
+- A Virus A ROM file (`.mid` format) — not included
 
 ## Installation
 
@@ -25,8 +25,9 @@ Then place your Virus ROM file in the module's `roms/` directory on the device:
 
 ## Supported ROMs
 
-- Virus A (`.mid` boot ROM format)
-- Virus B/C (`.bin` firmware format)
+- **Virus A** (`.mid` boot ROM format) — recommended, tested on Move hardware
+
+Virus B/C ROMs are not supported on Move. The Virus B/C DSP models require more processing power than the Move's Cortex-A72 can provide in real time.
 
 ## Architecture
 

@@ -1,0 +1,22 @@
+This project is licensed under the GNU General Public License v3.0.
+
+The full text of the GPL-3.0 license is available at:
+https://www.gnu.org/licenses/gpl-3.0.html
+
+And in libs/gearmulator/LICENSE.md
+
+This project includes and links against the following components:
+
+1. Gearmulator by dsp56300 (https://github.com/dsp56300/gearmulator)
+   License: GPL-3.0
+
+2. dsp56300 DSP emulator (https://github.com/dsp56300/dsp56300)
+   License: GPL-3.0
+
+3. libresample by Dominic Mazzoni
+   License: BSD-2-Clause or LGPL-2.1
+
+4. asmjit (https://github.com/asmjit/asmjit)
+   License: Zlib (GPL-compatible)
+
+The plugin wrapper code (src/dsp/virus_plugin.cpp) is also GPL-3.0.
