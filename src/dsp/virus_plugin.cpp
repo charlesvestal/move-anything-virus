@@ -27,6 +27,8 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
+#include <sched.h>
 #include <vector>
 #include <string>
 #include <array>
@@ -38,6 +40,7 @@
 #include "virusLib/dspSingle.h"
 #include "virusLib/microcontroller.h"
 #include "virusLib/romfile.h"
+#include "virusLib/romloader.h"
 #include "virusLib/deviceModel.h"
 #include "dsp56kEmu/audio.h"
 #include "dsp56kEmu/semaphore.h"
@@ -87,8 +90,16 @@ typedef struct plugin_api_v2 {
 
 #define AUDIO_RING_SIZE     8192    /* Stereo frame pairs */
 #define EMU_CHUNK           64      /* Frames per processAudio() call (matches console app) */
+#define OUTPUT_GAIN         1.0f    /* Peak levels measured at ~0.4, no gain reduction needed */
 
 static const host_api_v1_t *g_host = nullptr;
+
+/* Microsecond clock */
+static int64_t now_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 
 /* Logging helper */
 static void plugin_log(const char *fmt, ...) {
@@ -217,11 +228,26 @@ struct virus_instance_t {
 
     int cc_values[128];
 
+    /* Resampler state (46875 → 44100) */
+    double resample_phase;   /* fractional position in source block */
+    float resample_prev_l;   /* last sample from previous block (for interpolation) */
+    float resample_prev_r;
+
     char loading_status[128];
     char load_error[256];
     volatile int underrun_count;
     volatile int render_count;
     volatile int emu_blocks;
+
+    /* Profiling stats (updated by emu thread, read by get_param) */
+    volatile int64_t prof_poll_us_total;   /* cumulative poll wait µs */
+    volatile int64_t prof_process_us_total; /* cumulative processAudio µs */
+    volatile int prof_timeout_count;       /* polls that hit 50-iteration limit */
+    volatile int prof_ring_min;            /* lowest ring_available seen in render */
+    volatile int prof_poll_max_us;         /* worst-case single poll wait µs */
+    volatile int prof_process_max_us;      /* worst-case single processAudio µs */
+    volatile float prof_peak_level;        /* peak absolute sample level (float, pre-clamp) */
+    volatile int64_t prof_start_us;        /* timestamp for MIPS calculation */
 
     char *pending_state;
     int pending_state_valid;
@@ -271,56 +297,27 @@ static void send_cc(virus_instance_t *inst, int cc, int value) {
  * ROM loading
  * ===================================================================== */
 
-static std::vector<uint8_t> load_file(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return {};
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> data(size);
-    size_t got = fread(data.data(), 1, size, f);
-    fclose(f);
-    if ((long)got != size) return {};
-    return data;
-}
-
 static bool find_and_load_rom(virus_instance_t *inst) {
     char roms_dir[512];
     snprintf(roms_dir, sizeof(roms_dir), "%s/roms", inst->module_dir);
-    DIR *dir = opendir(roms_dir);
-    if (!dir) {
+    fprintf(stderr, "Virus: searching for ROMs in %s\n", roms_dir);
+
+    /* Use gearmulator's ROMLoader which handles both .bin and .mid files,
+     * does MIDI-to-ROM conversion, and auto-detects Model A/B/C. */
+    auto roms = virusLib::ROMLoader::findROMs(std::string(roms_dir));
+    if (roms.empty()) {
         snprintf(inst->load_error, sizeof(inst->load_error),
-                 "No roms/ directory. Place a Virus ROM (.bin) in roms/");
+                 "No valid ROM found. Place a Virus ROM (.bin or .mid) in roms/");
         return false;
     }
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        const char *name = entry->d_name;
-        size_t len = strlen(name);
-        if (len < 5 || strcasecmp(name + len - 4, ".bin") != 0) continue;
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", roms_dir, name);
-        fprintf(stderr, "Virus: trying ROM: %s\n", name);
-        std::vector<uint8_t> data = load_file(path);
-        if (data.empty()) continue;
-        virusLib::DeviceModel model = virusLib::DeviceModel::ABC;
-        if (data.size() == virusLib::ROMFile::getRomSizeModelABC())
-            model = virusLib::DeviceModel::ABC;
-        else if (data.size() == virusLib::ROMFile::getRomSizeModelD())
-            model = virusLib::DeviceModel::ABC;
-        inst->rom = new virusLib::ROMFile(std::move(data), std::string(name), model);
-        if (inst->rom->isValid()) {
-            fprintf(stderr, "Virus: loaded ROM %s (model: %s, rate: %u)\n",
-                    name, inst->rom->getModelName().c_str(), inst->rom->getSamplerate());
-            closedir(dir);
-            return true;
-        }
-        delete inst->rom;
-        inst->rom = nullptr;
-    }
-    closedir(dir);
-    snprintf(inst->load_error, sizeof(inst->load_error), "No valid ROM in roms/");
-    return false;
+
+    /* Use the first valid ROM found */
+    inst->rom = new virusLib::ROMFile(std::move(roms.front()));
+    fprintf(stderr, "Virus: loaded ROM %s (model: %s, rate: %u)\n",
+            inst->rom->getFilename().c_str(),
+            inst->rom->getModelName().c_str(),
+            inst->rom->getSamplerate());
+    return true;
 }
 
 /* =====================================================================
@@ -345,9 +342,26 @@ static void update_preset_name(virus_instance_t *inst) {
  * Emulation thread (semaphore-driven, no thread contention)
  * ===================================================================== */
 
+/* Resample ratio: 46875 Hz source → 44100 Hz output */
+static constexpr double RESAMPLE_RATIO = 46875.0 / 44100.0; /* ~1.06293 src frames per dst frame */
+/* Max output frames per EMU_CHUNK input: ceil(64 / 1.06293) + 1 = ~62 */
+#define RESAMPLE_MAX_OUT (EMU_CHUNK + 4)
+
 static void* emu_thread_func(void *arg) {
     virus_instance_t *inst = (virus_instance_t*)arg;
-    fprintf(stderr, "Virus: emu thread started (direct mode, chunk=%d)\n", EMU_CHUNK);
+
+    /* Set real-time priority for emu thread */
+    struct sched_param sp;
+    sp.sched_priority = 40;  /* Below Move's audio thread but above normal */
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0)
+        fprintf(stderr, "Virus: emu thread RT priority set (SCHED_FIFO, pri=40)\n");
+    else
+        fprintf(stderr, "Virus: emu thread RT priority failed (running as normal)\n");
+
+    fprintf(stderr, "Virus: emu thread started (semaphore mode, chunk=%d, resample %.0f->%d)\n",
+            EMU_CHUNK, DEVICE_RATE, MOVE_SAMPLE_RATE);
+
+    inst->prof_start_us = now_us();
 
     float proc_l[EMU_CHUNK];
     float proc_r[EMU_CHUNK];
@@ -355,60 +369,109 @@ static void* emu_thread_func(void *arg) {
 
     while (inst->emu_thread_running) {
         /* Check our ring buffer space first */
-        if (ring_free(inst) < EMU_CHUNK) {
-            usleep(500);
+        if (ring_free(inst) < RESAMPLE_MAX_OUT) {
+            usleep(200);
             continue;
         }
 
-        /* Poll for DSP frames with timeout fallback.
-         * Diagnostics showed: 64 frames ready after ~1.2ms (6 × 200µs).
-         * If timeout expires, processAudio will block internally. */
-        int polls = 0;
-        size_t avail = audioOutputs.size();
-        while (avail < (size_t)EMU_CHUNK && polls < 50) {
-            if (!inst->emu_thread_running) goto done;
-            usleep(200);
-            avail = audioOutputs.size();
-            polls++;
-        }
+        /* Wait for DSP callback to signal that enough frames are ready.
+         * This matches the console app pattern — when the semaphore fires,
+         * the ring buffer already has EMU_CHUNK-4 frames, so processAudio's
+         * internal waitNotEmpty() returns immediately with zero contention.
+         * This eliminates the ~50-73 MIPS of overhead from manual polling. */
+        inst->audio_sem->wait();
+        if (!inst->emu_thread_running) goto done;
+
         synthLib::TAudioInputs inputs = {};
         synthLib::TAudioOutputs outputs = {};
         outputs[0] = proc_l;
         outputs[1] = proc_r;
 
+        int64_t t_proc_start = now_us();
         inst->dsp->processAudio(inputs, outputs, EMU_CHUNK, EMU_CHUNK);
+        int64_t t_proc_end = now_us();
+        int64_t proc_us = t_proc_end - t_proc_start;
+        inst->prof_process_us_total += proc_us;
+        if ((int)proc_us > inst->prof_process_max_us) inst->prof_process_max_us = (int)proc_us;
         inst->emu_blocks++;
 
-        /* Convert to int16 and write to ring buffer */
-        if (ring_free(inst) < EMU_CHUNK) {
-            /* Ring buffer full — drop this block */
-            continue;
+        /* Track peak level (pre-clamp) for distortion diagnosis */
+        for (int i = 0; i < EMU_CHUNK; i++) {
+            float al = fabsf(proc_l[i]);
+            float ar = fabsf(proc_r[i]);
+            float peak = al > ar ? al : ar;
+            if (peak > inst->prof_peak_level) inst->prof_peak_level = peak;
+        }
+        /* Log stats every ~2 seconds (2 * 46875 / 64 ≈ 1465 blocks) */
+        if ((inst->emu_blocks % 1465) == 0) {
+            /* Calculate MIPS: blocks * 64 frames * (instructions per frame at 108 MHz)
+             * At 46875 Hz, each frame = 108M/46875 = 2304 instructions.
+             * MIPS = (emu_blocks * 64 * 2304) / elapsed_us */
+            int64_t now = now_us();
+            double elapsed_s = (now - inst->prof_start_us) / 1000000.0;
+            double mips = 0;
+            if (elapsed_s > 0.1) {
+                double total_instructions = (double)inst->emu_blocks * EMU_CHUNK * 2304.0;
+                mips = total_instructions / elapsed_s / 1000000.0;
+            }
+            fprintf(stderr, "Virus: peak=%.3f buf=%d ur=%d blk=%d mips=%.1f\n",
+                    (double)inst->prof_peak_level, ring_available(inst),
+                    inst->underrun_count, inst->emu_blocks, mips);
+            inst->prof_peak_level = 0.0f; /* reset for next interval */
         }
 
-        int16_t block_i16[EMU_CHUNK * 2];
-        for (int i = 0; i < EMU_CHUNK; i++) {
-            int32_t l = (int32_t)(proc_l[i] * 32767.0f);
-            int32_t r = (int32_t)(proc_r[i] * 32767.0f);
-            if (l > 32767) l = 32767; if (l < -32768) l = -32768;
-            if (r > 32767) r = 32767; if (r < -32768) r = -32768;
-            block_i16[i * 2 + 0] = (int16_t)l;
-            block_i16[i * 2 + 1] = (int16_t)r;
+        /* Resample 46875→44100 using linear interpolation.
+         * resample_phase tracks our fractional position in the source block.
+         * We use the previous block's last sample for cross-boundary interpolation. */
+        float ext_l[EMU_CHUNK + 1], ext_r[EMU_CHUNK + 1];
+        ext_l[0] = inst->resample_prev_l;
+        ext_r[0] = inst->resample_prev_r;
+        memcpy(ext_l + 1, proc_l, EMU_CHUNK * sizeof(float));
+        memcpy(ext_r + 1, proc_r, EMU_CHUNK * sizeof(float));
+
+        int16_t resampled[RESAMPLE_MAX_OUT * 2];
+        int out_count = 0;
+
+        while (inst->resample_phase < (double)EMU_CHUNK && out_count < RESAMPLE_MAX_OUT) {
+            /* ext buffer is offset by 1: ext[0]=prev, ext[1]=proc[0], etc. */
+            double ext_pos = inst->resample_phase + 1.0;
+            int idx = (int)ext_pos;
+            double frac = ext_pos - idx;
+            if (idx >= EMU_CHUNK) break;
+
+            float l = ext_l[idx] * (float)(1.0 - frac) + ext_l[idx + 1] * (float)frac;
+            float r = ext_r[idx] * (float)(1.0 - frac) + ext_r[idx + 1] * (float)frac;
+
+            int32_t li = (int32_t)(l * OUTPUT_GAIN * 32767.0f);
+            int32_t ri = (int32_t)(r * OUTPUT_GAIN * 32767.0f);
+            if (li > 32767) li = 32767; if (li < -32768) li = -32768;
+            if (ri > 32767) ri = 32767; if (ri < -32768) ri = -32768;
+            resampled[out_count * 2 + 0] = (int16_t)li;
+            resampled[out_count * 2 + 1] = (int16_t)ri;
+            out_count++;
+            inst->resample_phase += RESAMPLE_RATIO;
         }
+        inst->resample_phase -= (double)EMU_CHUNK;
+        inst->resample_prev_l = proc_l[EMU_CHUNK - 1];
+        inst->resample_prev_r = proc_r[EMU_CHUNK - 1];
+
+        /* Write resampled frames to ring buffer */
+        if (ring_free(inst) < out_count) continue; /* drop if full */
 
         int wr = inst->ring_write;
-        for (int i = 0; i < EMU_CHUNK; i++) {
-            inst->audio_ring[wr * 2 + 0] = block_i16[i * 2 + 0];
-            inst->audio_ring[wr * 2 + 1] = block_i16[i * 2 + 1];
+        for (int i = 0; i < out_count; i++) {
+            inst->audio_ring[wr * 2 + 0] = resampled[i * 2 + 0];
+            inst->audio_ring[wr * 2 + 1] = resampled[i * 2 + 1];
             wr = (wr + 1) % AUDIO_RING_SIZE;
         }
         inst->ring_write = wr;
 
         /* WAV capture */
         if (inst->capture_emu_file && inst->capture_frames_written < inst->capture_max_frames) {
-            int to_cap = EMU_CHUNK;
+            int to_cap = out_count;
             if (inst->capture_frames_written + to_cap > inst->capture_max_frames)
                 to_cap = inst->capture_max_frames - inst->capture_frames_written;
-            fwrite(block_i16, sizeof(int16_t) * 2, to_cap, inst->capture_emu_file);
+            fwrite(resampled, sizeof(int16_t) * 2, to_cap, inst->capture_emu_file);
         }
     }
 
@@ -515,17 +578,35 @@ static void* boot_thread_func(void *arg) {
         outputs[0] = dummy_l; outputs[1] = dummy_r;
 
         int retries = 0;
-        fprintf(stderr, "Virus: waiting for DSP boot...\n");
-        while (!inst->mc->dspHasBooted() && retries < 512) {
-            if (inst->shutting_down) {
-                fprintf(stderr, "Virus: abort during boot wait\n");
-                goto cleanup_and_exit;
+        fprintf(stderr, "Virus: waiting for DSP boot (model=%d)...\n",
+                (int)inst->rom->getModel());
+
+        if (inst->rom->getModel() == virusLib::DeviceModel::A) {
+            /* Model A never signals dspHasBooted — just process 32 chunks */
+            for (int i = 0; i < 32; i++) {
+                if (inst->shutting_down) goto cleanup_and_exit;
+                inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
             }
-            inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
-            retries++;
+            inst->dsp->disableESSI1();
+            retries = 32;
+        } else {
+            /* Model B/C: wait for boot signal with timeout */
+            while (!inst->mc->dspHasBooted() && retries < 512) {
+                if (inst->shutting_down) {
+                    fprintf(stderr, "Virus: abort during boot wait\n");
+                    goto cleanup_and_exit;
+                }
+                inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
+                retries++;
+            }
         }
         fprintf(stderr, "Virus: DSP booted after %d drain cycles (%d frames)\n",
                 retries, retries * BOOT_CHUNK);
+
+        /* Run at full DSP clock. Model A needs ~66 MIPS (achievable),
+         * Model B needs ~108 MIPS (marginal on Move hardware). */
+        fprintf(stderr, "Virus: DSP clock at 100%% (model=%s)\n",
+                inst->rom->getModelName().c_str());
 
         /* 7. Initialize (mirrors Device constructor post-boot sequence) */
         inst->mc->sendInitControlCommands(127);
@@ -574,7 +655,7 @@ static void* boot_thread_func(void *arg) {
         synthLib::TAudioOutputs outputs = {};
         outputs[0] = wl; outputs[1] = wr;
 
-        for (int fill = 0; fill < 32 && ring_free(inst) >= EMU_CHUNK; fill++) {
+        for (int fill = 0; fill < 4 && ring_free(inst) >= EMU_CHUNK; fill++) {
             inst->dsp->processAudio(inputs, outputs, EMU_CHUNK, 0);
             int wr_pos = inst->ring_write;
             for (int i = 0; i < EMU_CHUNK; i++) {
@@ -591,8 +672,11 @@ static void* boot_thread_func(void *arg) {
     }
     fprintf(stderr, "Virus: pre-filled %d frames\n", ring_available(inst));
 
-    /* Semaphore accumulated signals during boot — not used by emu thread
-     * in direct mode, but keep it for future optimization. */
+    /* Drain semaphore signals accumulated during boot.
+     * Replace with a fresh semaphore so the emu thread starts clean. */
+    delete inst->audio_sem;
+    inst->audio_sem = new dsp56k::SpscSemaphore(1);
+    inst->notify_timeout.store(0);
 
     /* 10. Start emu thread */
     inst->emu_thread_running = 1;
@@ -837,8 +921,26 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "loading_status") == 0) return snprintf(buf, buf_len, "%s", inst->loading_status);
     if (strcmp(key, "debug_info") == 0) {
         int avail = ring_available(inst);
-        return snprintf(buf, buf_len, "buf=%d/%d ur=%d emu=%d",
-                        avail, AUDIO_RING_SIZE, inst->underrun_count, inst->emu_blocks);
+        int blocks = inst->emu_blocks > 0 ? inst->emu_blocks : 1;
+        return snprintf(buf, buf_len,
+            "buf=%d min=%d ur=%d blk=%d "
+            "proc_avg=%lld proc_max=%d peak=%.2f",
+            avail, inst->prof_ring_min, inst->underrun_count, inst->emu_blocks,
+            (long long)(inst->prof_process_us_total / blocks),
+            inst->prof_process_max_us,
+            (double)inst->prof_peak_level);
+    }
+    if (strcmp(key, "prof_reset") == 0) {
+        inst->prof_poll_us_total = 0;
+        inst->prof_process_us_total = 0;
+        inst->prof_timeout_count = 0;
+        inst->prof_ring_min = AUDIO_RING_SIZE;
+        inst->prof_poll_max_us = 0;
+        inst->prof_process_max_us = 0;
+        inst->prof_peak_level = 0.0f;
+        inst->underrun_count = 0;
+        inst->emu_blocks = 0;
+        return snprintf(buf, buf_len, "reset");
     }
     for (int i = 0; i < NUM_PARAMS; i++)
         if (strcmp(key, g_params[i].key) == 0)
@@ -888,6 +990,8 @@ static void v2_render_block(void *instance, int16_t *out, int frames) {
     }
 
     int avail = ring_available(inst);
+    if (inst->prof_ring_min == 0 || avail < inst->prof_ring_min)
+        inst->prof_ring_min = avail;
     int to_read = (avail < frames) ? avail : frames;
     int rd = inst->ring_read;
     for (int i = 0; i < to_read; i++) {
