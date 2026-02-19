@@ -2,12 +2,21 @@
     "id": "virus",
     "name": "Virus",
     "abbrev": "VR",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "description": "Access Virus DSP56300 emulator (Gearmulator)",
-    "author": "dsp56300/gearmulator",
+    "author": "dsp56300/gearmulator (port: charlesvestal)",
     "ui": "ui.js",
     "dsp": "dsp.so",
     "api_version": 2,
+    "assets": {
+        "path": "roms",
+        "label": "ROMs",
+        "extensions": [".bin", ".mid"],
+        "description": "Requires an Access Virus ROM file. Supports Virus A (.mid), B, or C (.bin) firmware.",
+        "hint": "Upload a Virus ROM file. Virus A uses .mid boot ROM format, Virus B/C uses .bin firmware format.",
+        "hint_url": "https://github.com/charlesvestal/move-anything-virus",
+        "hint_url_label": "Read more"
+    },
     "capabilities": {
         "audio_out": true,
         "audio_in": false,
