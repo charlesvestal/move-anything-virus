@@ -1,0 +1,3 @@
+[submodule "libs/gearmulator"]
+	path = libs/gearmulator
+	url = /Volumes/ExtFS/charlesvestal/github/gearmulator
