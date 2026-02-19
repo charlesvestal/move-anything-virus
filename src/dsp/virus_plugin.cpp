@@ -1,20 +1,23 @@
 /*
  * Virus DSP Plugin for Move Anything
  *
- * Uses DspSingle + Microcontroller directly (bypassing Device/Plugin wrapper)
- * with a semaphore-based callback pattern from the gearmulator console app.
- * This eliminates the thread contention in waitNotEmpty() that caused the
- * Device+Plugin approach to achieve only ~63% real-time throughput.
+ * Runs the DSP56300 JIT emulator in a CHILD PROCESS to avoid sharing
+ * MoveOriginal's mmap_lock, heap allocator, and other kernel resources.
+ * Communication between parent (plugin API) and child (DSP) uses a
+ * shared memory region with an audio ring buffer and MIDI FIFO.
  *
- * The DSP thread runs the JIT-compiled DSP56300 code and calls our callback
- * for each output frame. The callback:
- *   1. Advances MIDI timing (getMidiQueue.onAudioWritten)
- *   2. Periodically processes the Microcontroller
- *   3. Signals a semaphore when enough frames are available
+ * Architecture:
+ *   Parent (MoveOriginal process):
+ *     - Plugin API v2 (create/destroy/render_block/on_midi/get_param/set_param)
+ *     - render_block reads audio from shared memory ring buffer
+ *     - on_midi writes to shared memory MIDI FIFO
+ *     - get_param/set_param read/write shared memory status
  *
- * The emu thread waits on the semaphore, then reads a full block of audio
- * from processAudio() — since data is guaranteed available, waitNotEmpty()
- * never blocks, eliminating mutex contention entirely.
+ *   Child (forked process):
+ *     - Owns all gearmulator objects (DspSingle, Microcontroller, ROMFile)
+ *     - DSP thread runs JIT-compiled DSP56300 code
+ *     - Emu thread reads audio from DSP, resamples 46875→44100, writes to shared ring
+ *     - MIDI consumer thread reads from shared MIDI FIFO, sends to Microcontroller
  *
  * GPL-3.0 License
  */
@@ -29,10 +32,16 @@
 #include <unistd.h>
 #include <time.h>
 #include <sched.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <vector>
 #include <string>
-#include <array>
-#include <mutex>
 #include <atomic>
 
 /* Gearmulator headers */
@@ -83,14 +92,11 @@ typedef struct plugin_api_v2 {
  * Constants
  * ===================================================================== */
 
-/* Virus ABC native rate: 12000000/256 = 46875 Hz.
- * Audio will be ~6% slow / ~1 semitone flat at 44100 playback.
- * TODO: add proper 46875->44100 resampling. */
 #define DEVICE_RATE         46875.0f
-
-#define AUDIO_RING_SIZE     8192    /* Stereo frame pairs */
-#define EMU_CHUNK           64      /* Frames per processAudio() call (matches console app) */
-#define OUTPUT_GAIN         1.0f    /* Peak levels measured at ~0.4, no gain reduction needed */
+#define AUDIO_RING_SIZE     8192
+#define EMU_CHUNK           64
+#define OUTPUT_GAIN         1.0f
+#define MIDI_FIFO_SIZE      4096  /* bytes */
 
 static const host_api_v1_t *g_host = nullptr;
 
@@ -114,45 +120,18 @@ static void plugin_log(const char *fmt, ...) {
     g_host->log(msg);
 }
 
-/* =====================================================================
- * WAV capture helpers
- * ===================================================================== */
-
-#define CAPTURE_SECONDS 10
-#define CAPTURE_MAX_FRAMES (MOVE_SAMPLE_RATE * CAPTURE_SECONDS)
-
-static FILE* wav_open(const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return nullptr;
-    uint8_t header[44] = {};
-    header[0]='R'; header[1]='I'; header[2]='F'; header[3]='F';
-    header[8]='W'; header[9]='A'; header[10]='V'; header[11]='E';
-    header[12]='f'; header[13]='m'; header[14]='t'; header[15]=' ';
-    header[16]=16;
-    header[20]=1; /* PCM */
-    header[22]=2; /* stereo */
-    header[24]=(MOVE_SAMPLE_RATE>>0)&0xFF; header[25]=(MOVE_SAMPLE_RATE>>8)&0xFF;
-    header[26]=(MOVE_SAMPLE_RATE>>16)&0xFF; header[27]=(MOVE_SAMPLE_RATE>>24)&0xFF;
-    int br=MOVE_SAMPLE_RATE*4;
-    header[28]=(br>>0)&0xFF; header[29]=(br>>8)&0xFF;
-    header[30]=(br>>16)&0xFF; header[31]=(br>>24)&0xFF;
-    header[32]=4; header[34]=16;
-    header[36]='d'; header[37]='a'; header[38]='t'; header[39]='a';
-    fwrite(header, 1, 44, f);
-    return f;
-}
-
-static void wav_close(FILE *f, int frames_written) {
-    if (!f) return;
-    int ds = frames_written*4, fs = ds+36;
-    uint8_t b[4];
-    fseek(f, 4, SEEK_SET);
-    b[0]=(fs>>0)&0xFF; b[1]=(fs>>8)&0xFF; b[2]=(fs>>16)&0xFF; b[3]=(fs>>24)&0xFF;
-    fwrite(b, 1, 4, f);
-    fseek(f, 40, SEEK_SET);
-    b[0]=(ds>>0)&0xFF; b[1]=(ds>>8)&0xFF; b[2]=(ds>>16)&0xFF; b[3]=(ds>>24)&0xFF;
-    fwrite(b, 1, 4, f);
-    fclose(f);
+/* Crash-safe log: writes to a dedicated file with immediate flush. */
+static FILE *g_vlog = nullptr;
+static void vlog(const char *fmt, ...) {
+    if (!g_vlog)
+        g_vlog = fopen("/data/UserData/move-anything/virus_debug.log", "a");
+    if (!g_vlog) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_vlog, fmt, args);
+    va_end(args);
+    fputc('\n', g_vlog);
+    fflush(g_vlog);
 }
 
 /* =====================================================================
@@ -188,388 +167,234 @@ static const virus_param_t g_params[] = {
 static const int NUM_PARAMS = sizeof(g_params) / sizeof(g_params[0]);
 
 /* =====================================================================
- * Instance structure
+ * Shared memory structure (parent <-> child process)
  * ===================================================================== */
 
-struct virus_instance_t {
-    char module_dir[256];
-
-    /* Direct DSP access (no Device/Plugin wrapper) */
-    virusLib::DspSingle *dsp;
-    virusLib::Microcontroller *mc;
-    virusLib::ROMFile *rom;
-    dsp56k::SpscSemaphore *audio_sem;
-
-    /* Callback state (accessed from DSP thread) */
-    std::atomic<int32_t> notify_timeout;
-    std::atomic<uint32_t> callback_count;
-
-    pthread_t boot_thread;
-    pthread_t emu_thread;
-    volatile int boot_thread_running;
-    volatile int emu_thread_running;
-    volatile int initialized;
-    volatile int loading_complete;
-    volatile int shutting_down;
-
-    /* Audio ring buffer (stereo interleaved int16) */
+struct virus_shm_t {
+    /* Audio ring buffer (child writes, parent reads) */
     int16_t audio_ring[AUDIO_RING_SIZE * 2];
     volatile int ring_read;
     volatile int ring_write;
 
-    /* Preset state */
-    int current_bank;
-    int current_preset;
-    int bank_count;
-    int preset_count;
-    char preset_name[64];
-    char bank_name[32];
-    int octave_transpose;
+    /* MIDI input FIFO (parent writes, child reads)
+     * Format: [len, byte0, byte1, byte2, ...] per message, len=1..8 */
+    uint8_t midi_buf[MIDI_FIFO_SIZE];
+    volatile int midi_read;
+    volatile int midi_write;
 
-    int cc_values[128];
+    /* Control flags */
+    volatile int child_ready;       /* child sets when boot complete */
+    volatile int child_shutdown;    /* parent sets to request shutdown */
+    volatile int child_alive;       /* child increments periodically */
 
-    /* Resampler state (46875 → 44100) */
-    double resample_phase;   /* fractional position in source block */
-    float resample_prev_l;   /* last sample from previous block (for interpolation) */
-    float resample_prev_r;
-
+    /* Status (child writes, parent reads) */
+    volatile int initialized;
+    volatile int loading_complete;
     char loading_status[128];
     char load_error[256];
+    char preset_name[64];
+    char bank_name[32];
+    volatile int current_bank;
+    volatile int current_preset;
+    volatile int bank_count;
+    volatile int preset_count;
+    volatile int octave_transpose;
+    volatile int cc_values[128];
+
+    /* Profiling */
     volatile int underrun_count;
-    volatile int render_count;
     volatile int emu_blocks;
+    volatile int render_count;
+    volatile int64_t prof_process_us_total;
+    volatile int prof_process_max_us;
+    volatile float prof_peak_level;
+    volatile int prof_ring_min;
+    volatile int64_t prof_start_us;
 
-    /* Profiling stats (updated by emu thread, read by get_param) */
-    volatile int64_t prof_poll_us_total;   /* cumulative poll wait µs */
-    volatile int64_t prof_process_us_total; /* cumulative processAudio µs */
-    volatile int prof_timeout_count;       /* polls that hit 50-iteration limit */
-    volatile int prof_ring_min;            /* lowest ring_available seen in render */
-    volatile int prof_poll_max_us;         /* worst-case single poll wait µs */
-    volatile int prof_process_max_us;      /* worst-case single processAudio µs */
-    volatile float prof_peak_level;        /* peak absolute sample level (float, pre-clamp) */
-    volatile int64_t prof_start_us;        /* timestamp for MIPS calculation */
-
-    char *pending_state;
-    int pending_state_valid;
-
-    /* WAV capture */
-    FILE *capture_emu_file;
-    FILE *capture_render_file;
-    int capture_frames_written;
-    int capture_max_frames;
-    volatile int capture_armed;
+    /* Module directory (set by parent before fork) */
+    char module_dir[256];
 };
 
 /* =====================================================================
- * Ring buffer helpers
+ * Shared memory ring buffer helpers
  * ===================================================================== */
 
-static int ring_available(virus_instance_t *inst) {
-    int avail = inst->ring_write - inst->ring_read;
+static int shm_ring_available(virus_shm_t *shm) {
+    int avail = shm->ring_write - shm->ring_read;
     if (avail < 0) avail += AUDIO_RING_SIZE;
     return avail;
 }
 
-static int ring_free(virus_instance_t *inst) {
-    return AUDIO_RING_SIZE - 1 - ring_available(inst);
+static int shm_ring_free(virus_shm_t *shm) {
+    return AUDIO_RING_SIZE - 1 - shm_ring_available(shm);
+}
+
+/* MIDI FIFO helpers */
+static int midi_fifo_available(virus_shm_t *shm) {
+    int avail = shm->midi_write - shm->midi_read;
+    if (avail < 0) avail += MIDI_FIFO_SIZE;
+    return avail;
+}
+
+static int midi_fifo_free(virus_shm_t *shm) {
+    return MIDI_FIFO_SIZE - 1 - midi_fifo_available(shm);
+}
+
+static void midi_fifo_push(virus_shm_t *shm, const uint8_t *msg, int len) {
+    if (len < 1 || len > 8) return;
+    if (midi_fifo_free(shm) < len + 1) return; /* drop if full */
+    int wr = shm->midi_write;
+    shm->midi_buf[wr] = (uint8_t)len;
+    wr = (wr + 1) % MIDI_FIFO_SIZE;
+    for (int i = 0; i < len; i++) {
+        shm->midi_buf[wr] = msg[i];
+        wr = (wr + 1) % MIDI_FIFO_SIZE;
+    }
+    shm->midi_write = wr;
 }
 
 /* =====================================================================
- * MIDI helpers (direct to Microcontroller, no Plugin wrapper)
+ * Instance structure (parent process only)
  * ===================================================================== */
 
-static void send_midi_to_mc(virus_instance_t *inst, const uint8_t *msg, int len) {
-    if (!inst->mc || len < 1) return;
+struct virus_instance_t {
+    virus_shm_t *shm;
+    pid_t child_pid;
+    pthread_t boot_thread;
+    volatile int boot_thread_running;
+    char *pending_state;
+    int pending_state_valid;
+};
+
+/* =====================================================================
+ * Child process — all DSP work happens here
+ * ===================================================================== */
+
+/* Resample ratio: 46875 Hz source → 44100 Hz output */
+static constexpr double RESAMPLE_RATIO = 46875.0 / 44100.0;
+#define RESAMPLE_MAX_OUT (EMU_CHUNK + 4)
+
+static void child_send_midi(virusLib::Microcontroller *mc, const uint8_t *msg, int len) {
+    if (!mc || len < 1) return;
     synthLib::SMidiEvent ev(synthLib::MidiEventSource::Host,
                             msg[0],
                             len > 1 ? msg[1] : 0,
                             len > 2 ? msg[2] : 0);
-    inst->mc->sendMIDI(ev);
+    mc->sendMIDI(ev);
 }
 
-static void send_cc(virus_instance_t *inst, int cc, int value) {
-    uint8_t msg[3] = { 0xB0, (uint8_t)cc, (uint8_t)value };
-    send_midi_to_mc(inst, msg, 3);
-    inst->cc_values[cc] = value;
-}
+static void child_process_midi_fifo(virus_shm_t *shm, virusLib::Microcontroller *mc) {
+    while (midi_fifo_available(shm) > 0) {
+        int rd = shm->midi_read;
+        int len = shm->midi_buf[rd];
+        rd = (rd + 1) % MIDI_FIFO_SIZE;
+        if (len < 1 || len > 8 || midi_fifo_available(shm) < len + 1) break;
+        uint8_t msg[8];
+        for (int i = 0; i < len; i++) {
+            msg[i] = shm->midi_buf[rd];
+            rd = (rd + 1) % MIDI_FIFO_SIZE;
+        }
+        shm->midi_read = rd;
 
-/* =====================================================================
- * ROM loading
- * ===================================================================== */
+        /* Track CC values in shared memory */
+        uint8_t status = msg[0] & 0xF0;
+        if (status == 0xB0 && len >= 3)
+            shm->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
 
-static bool find_and_load_rom(virus_instance_t *inst) {
-    char roms_dir[512];
-    snprintf(roms_dir, sizeof(roms_dir), "%s/roms", inst->module_dir);
-    fprintf(stderr, "Virus: searching for ROMs in %s\n", roms_dir);
-
-    /* Use gearmulator's ROMLoader which handles both .bin and .mid files,
-     * does MIDI-to-ROM conversion, and auto-detects Model A/B/C. */
-    auto roms = virusLib::ROMLoader::findROMs(std::string(roms_dir));
-    if (roms.empty()) {
-        snprintf(inst->load_error, sizeof(inst->load_error),
-                 "No valid ROM found. Place a Virus ROM (.bin or .mid) in roms/");
-        return false;
+        child_send_midi(mc, msg, len);
     }
-
-    /* Use the first valid ROM found */
-    inst->rom = new virusLib::ROMFile(std::move(roms.front()));
-    fprintf(stderr, "Virus: loaded ROM %s (model: %s, rate: %u)\n",
-            inst->rom->getFilename().c_str(),
-            inst->rom->getModelName().c_str(),
-            inst->rom->getSamplerate());
-    return true;
 }
 
-/* =====================================================================
- * Preset enumeration
- * ===================================================================== */
-
-static void update_bank_name(virus_instance_t *inst) {
-    snprintf(inst->bank_name, sizeof(inst->bank_name), "Bank %c", 'A' + inst->current_bank);
-}
-
-static void update_preset_name(virus_instance_t *inst) {
-    if (!inst->rom) { snprintf(inst->preset_name, sizeof(inst->preset_name), "No ROM"); return; }
+static void child_update_preset_name(virus_shm_t *shm, virusLib::ROMFile *rom) {
     virusLib::ROMFile::TPreset pd;
-    if (inst->rom->getSingle(inst->current_bank, inst->current_preset, pd))
-        snprintf(inst->preset_name, sizeof(inst->preset_name), "%s",
+    if (rom->getSingle(shm->current_bank, shm->current_preset, pd))
+        snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "%s",
                  virusLib::ROMFile::getSingleName(pd).c_str());
     else
-        snprintf(inst->preset_name, sizeof(inst->preset_name), "---");
+        snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "---");
 }
 
-/* =====================================================================
- * Emulation thread (semaphore-driven, no thread contention)
- * ===================================================================== */
+static void child_main(virus_shm_t *shm) {
+    /* We're in the child process now. Reset signal handlers. */
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    signal(SIGABRT, SIG_DFL);
 
-/* Resample ratio: 46875 Hz source → 44100 Hz output */
-static constexpr double RESAMPLE_RATIO = 46875.0 / 44100.0; /* ~1.06293 src frames per dst frame */
-/* Max output frames per EMU_CHUNK input: ceil(64 / 1.06293) + 1 = ~62 */
-#define RESAMPLE_MAX_OUT (EMU_CHUNK + 4)
+    /* Close the vlog FILE from parent (we'll reopen) */
+    if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
 
-static void* emu_thread_func(void *arg) {
-    virus_instance_t *inst = (virus_instance_t*)arg;
-
-    /* Set real-time priority for emu thread */
-    struct sched_param sp;
-    sp.sched_priority = 40;  /* Below Move's audio thread but above normal */
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0)
-        fprintf(stderr, "Virus: emu thread RT priority set (SCHED_FIFO, pri=40)\n");
-    else
-        fprintf(stderr, "Virus: emu thread RT priority failed (running as normal)\n");
-
-    fprintf(stderr, "Virus: emu thread started (semaphore mode, chunk=%d, resample %.0f->%d)\n",
-            EMU_CHUNK, DEVICE_RATE, MOVE_SAMPLE_RATE);
-
-    inst->prof_start_us = now_us();
-
-    float proc_l[EMU_CHUNK];
-    float proc_r[EMU_CHUNK];
-    auto& audioOutputs = inst->dsp->getAudio().getAudioOutputs();
-
-    while (inst->emu_thread_running) {
-        /* Check our ring buffer space first */
-        if (ring_free(inst) < RESAMPLE_MAX_OUT) {
-            usleep(200);
-            continue;
-        }
-
-        /* Wait for DSP callback to signal that enough frames are ready.
-         * This matches the console app pattern — when the semaphore fires,
-         * the ring buffer already has EMU_CHUNK-4 frames, so processAudio's
-         * internal waitNotEmpty() returns immediately with zero contention.
-         * This eliminates the ~50-73 MIPS of overhead from manual polling. */
-        inst->audio_sem->wait();
-        if (!inst->emu_thread_running) goto done;
-
-        synthLib::TAudioInputs inputs = {};
-        synthLib::TAudioOutputs outputs = {};
-        outputs[0] = proc_l;
-        outputs[1] = proc_r;
-
-        int64_t t_proc_start = now_us();
-        inst->dsp->processAudio(inputs, outputs, EMU_CHUNK, EMU_CHUNK);
-        int64_t t_proc_end = now_us();
-        int64_t proc_us = t_proc_end - t_proc_start;
-        inst->prof_process_us_total += proc_us;
-        if ((int)proc_us > inst->prof_process_max_us) inst->prof_process_max_us = (int)proc_us;
-        inst->emu_blocks++;
-
-        /* Track peak level (pre-clamp) for distortion diagnosis */
-        for (int i = 0; i < EMU_CHUNK; i++) {
-            float al = fabsf(proc_l[i]);
-            float ar = fabsf(proc_r[i]);
-            float peak = al > ar ? al : ar;
-            if (peak > inst->prof_peak_level) inst->prof_peak_level = peak;
-        }
-        /* Log stats every ~2 seconds (2 * 46875 / 64 ≈ 1465 blocks) */
-        if ((inst->emu_blocks % 1465) == 0) {
-            /* Calculate MIPS: blocks * 64 frames * (instructions per frame at 108 MHz)
-             * At 46875 Hz, each frame = 108M/46875 = 2304 instructions.
-             * MIPS = (emu_blocks * 64 * 2304) / elapsed_us */
-            int64_t now = now_us();
-            double elapsed_s = (now - inst->prof_start_us) / 1000000.0;
-            double mips = 0;
-            if (elapsed_s > 0.1) {
-                double total_instructions = (double)inst->emu_blocks * EMU_CHUNK * 2304.0;
-                mips = total_instructions / elapsed_s / 1000000.0;
-            }
-            fprintf(stderr, "Virus: peak=%.3f buf=%d ur=%d blk=%d mips=%.1f\n",
-                    (double)inst->prof_peak_level, ring_available(inst),
-                    inst->underrun_count, inst->emu_blocks, mips);
-            inst->prof_peak_level = 0.0f; /* reset for next interval */
-        }
-
-        /* Resample 46875→44100 using linear interpolation.
-         * resample_phase tracks our fractional position in the source block.
-         * We use the previous block's last sample for cross-boundary interpolation. */
-        float ext_l[EMU_CHUNK + 1], ext_r[EMU_CHUNK + 1];
-        ext_l[0] = inst->resample_prev_l;
-        ext_r[0] = inst->resample_prev_r;
-        memcpy(ext_l + 1, proc_l, EMU_CHUNK * sizeof(float));
-        memcpy(ext_r + 1, proc_r, EMU_CHUNK * sizeof(float));
-
-        int16_t resampled[RESAMPLE_MAX_OUT * 2];
-        int out_count = 0;
-
-        while (inst->resample_phase < (double)EMU_CHUNK && out_count < RESAMPLE_MAX_OUT) {
-            /* ext buffer is offset by 1: ext[0]=prev, ext[1]=proc[0], etc. */
-            double ext_pos = inst->resample_phase + 1.0;
-            int idx = (int)ext_pos;
-            double frac = ext_pos - idx;
-            if (idx >= EMU_CHUNK) break;
-
-            float l = ext_l[idx] * (float)(1.0 - frac) + ext_l[idx + 1] * (float)frac;
-            float r = ext_r[idx] * (float)(1.0 - frac) + ext_r[idx + 1] * (float)frac;
-
-            int32_t li = (int32_t)(l * OUTPUT_GAIN * 32767.0f);
-            int32_t ri = (int32_t)(r * OUTPUT_GAIN * 32767.0f);
-            if (li > 32767) li = 32767; if (li < -32768) li = -32768;
-            if (ri > 32767) ri = 32767; if (ri < -32768) ri = -32768;
-            resampled[out_count * 2 + 0] = (int16_t)li;
-            resampled[out_count * 2 + 1] = (int16_t)ri;
-            out_count++;
-            inst->resample_phase += RESAMPLE_RATIO;
-        }
-        inst->resample_phase -= (double)EMU_CHUNK;
-        inst->resample_prev_l = proc_l[EMU_CHUNK - 1];
-        inst->resample_prev_r = proc_r[EMU_CHUNK - 1];
-
-        /* Write resampled frames to ring buffer */
-        if (ring_free(inst) < out_count) continue; /* drop if full */
-
-        int wr = inst->ring_write;
-        for (int i = 0; i < out_count; i++) {
-            inst->audio_ring[wr * 2 + 0] = resampled[i * 2 + 0];
-            inst->audio_ring[wr * 2 + 1] = resampled[i * 2 + 1];
-            wr = (wr + 1) % AUDIO_RING_SIZE;
-        }
-        inst->ring_write = wr;
-
-        /* WAV capture */
-        if (inst->capture_emu_file && inst->capture_frames_written < inst->capture_max_frames) {
-            int to_cap = out_count;
-            if (inst->capture_frames_written + to_cap > inst->capture_max_frames)
-                to_cap = inst->capture_max_frames - inst->capture_frames_written;
-            fwrite(resampled, sizeof(int16_t) * 2, to_cap, inst->capture_emu_file);
-        }
-    }
-
-done:
-    fprintf(stderr, "Virus: emu thread stopped (%d blocks)\n", inst->emu_blocks);
-    return nullptr;
-}
-
-/* =====================================================================
- * Boot thread
- * ===================================================================== */
-
-static void* boot_thread_func(void *arg) {
-    virus_instance_t *inst = (virus_instance_t*)arg;
-    fprintf(stderr, "Virus: boot thread started\n");
+    vlog("[child] started, pid=%d", (int)getpid());
+    fprintf(stderr, "Virus child: started pid=%d\n", (int)getpid());
 
     /* 1. Load ROM */
-    snprintf(inst->loading_status, sizeof(inst->loading_status), "Loading ROM...");
-    if (!find_and_load_rom(inst)) {
-        inst->initialized = 1; inst->loading_complete = 1;
-        inst->boot_thread_running = 0;
-        return nullptr;
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Loading ROM...");
+    char roms_dir[512];
+    snprintf(roms_dir, sizeof(roms_dir), "%s/roms", shm->module_dir);
+    auto roms = virusLib::ROMLoader::findROMs(std::string(roms_dir));
+    if (roms.empty()) {
+        snprintf((char*)shm->load_error, sizeof(shm->load_error),
+                 "No valid ROM found. Place a Virus ROM in roms/");
+        shm->initialized = 1; shm->loading_complete = 1;
+        vlog("[child] no ROM found, exiting");
+        return;
     }
+    virusLib::ROMFile *rom = new virusLib::ROMFile(std::move(roms.front()));
+    vlog("[child] ROM loaded: %s model=%s", rom->getFilename().c_str(), rom->getModelName().c_str());
 
-    /* 2. Create DspSingle via Device's static factory */
-    snprintf(inst->loading_status, sizeof(inst->loading_status), "Creating DSP...");
-    fprintf(stderr, "Virus: creating DspSingle (JIT)...\n");
-
+    /* 2. Create DSP instances */
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Creating DSP...");
+    vlog("[child] creating DspSingle...");
     virusLib::DspSingle *dsp1 = nullptr;
     virusLib::DspSingle *dsp2 = nullptr;
-
     try {
-        virusLib::Device::createDspInstances(dsp1, dsp2, *inst->rom, DEVICE_RATE);
+        virusLib::Device::createDspInstances(dsp1, dsp2, *rom, DEVICE_RATE);
     } catch (const std::exception& e) {
-        fprintf(stderr, "Virus: DSP creation failed: %s\n", e.what());
-        snprintf(inst->load_error, sizeof(inst->load_error), "DSP creation failed: %s", e.what());
-        inst->initialized = 1; inst->loading_complete = 1;
-        inst->boot_thread_running = 0;
-        return nullptr;
+        snprintf((char*)shm->load_error, sizeof(shm->load_error), "DSP creation failed: %s", e.what());
+        shm->initialized = 1; shm->loading_complete = 1;
+        vlog("[child] DSP creation failed: %s", e.what());
+        delete rom;
+        return;
     }
-
-    inst->dsp = dsp1;
+    vlog("[child] createDspInstances OK");
 
     /* 3. Create Microcontroller */
-    fprintf(stderr, "Virus: creating Microcontroller...\n");
-    inst->mc = new virusLib::Microcontroller(*inst->dsp, *inst->rom, false);
+    vlog("[child] creating Microcontroller...");
+    virusLib::Microcontroller *mc = new virusLib::Microcontroller(*dsp1, *rom, false);
 
-    /* 4. Set up semaphore and audio callback.
-     * This callback runs on the DSP thread context for every output frame.
-     * It replaces Device::onAudioWritten() with additional semaphore logic. */
-    inst->audio_sem = new dsp56k::SpscSemaphore(1);
-    inst->notify_timeout.store(0);
-    inst->callback_count.store(0);
+    /* 4. Set up semaphore and audio callback */
+    dsp56k::SpscSemaphore audio_sem(1);
+    std::atomic<int32_t> notify_timeout{0};
+    std::atomic<uint32_t> callback_count{0};
+    std::atomic<bool> sem_active{false};
 
-    auto& audio = inst->dsp->getAudio();
-
-    audio.setCallback([inst](dsp56k::Audio* a) {
-        /* Advance MIDI timing — critical for event dispatch.
-         * Without this, MIDI events (init commands, preset data, notes)
-         * queued via sendMIDI are never dispatched to the DSP. */
-        inst->mc->getMidiQueue(0).onAudioWritten();
-
-        /* Periodically process microcontroller and read MIDI output.
-         * Every 4th frame matches the console app pattern. */
-        uint32_t count = inst->callback_count.fetch_add(1) + 1;
+    auto& audio = dsp1->getAudio();
+    audio.setCallback([&](dsp56k::Audio* a) {
+        mc->getMidiQueue(0).onAudioWritten();
+        uint32_t count = callback_count.fetch_add(1) + 1;
         if ((count & 0x3) == 0) {
             std::vector<synthLib::SMidiEvent> midiOut;
-            inst->mc->readMidiOut(midiOut);
-            inst->mc->process();
+            mc->readMidiOut(midiOut);
+            mc->process();
         }
-
-        /* Signal semaphore when enough frames are available.
-         * This is the key optimization: the emu thread waits on this
-         * semaphore instead of having processAudio block in waitNotEmpty.
-         * When the semaphore fires, data is guaranteed ready, so
-         * waitNotEmpty returns immediately with no mutex contention. */
-        const auto avail = a->getAudioOutputs().size();
-        int32_t timeout = inst->notify_timeout.load();
-        timeout--;
-        if (timeout <= 0 && avail >= (EMU_CHUNK - 4)) {
-            timeout = (EMU_CHUNK - 4);
-            inst->audio_sem->notify();
+        if (sem_active.load(std::memory_order_relaxed)) {
+            const auto avail = a->getAudioOutputs().size();
+            int32_t timeout = notify_timeout.load();
+            timeout--;
+            if (timeout <= 0 && avail >= (EMU_CHUNK - 4)) {
+                timeout = (EMU_CHUNK - 4);
+                audio_sem.notify();
+            }
+            notify_timeout.store(timeout);
         }
-        inst->notify_timeout.store(timeout);
     }, 0);
 
-    /* 5. Boot DSPs (JIT compilation + start DSP thread) */
-    snprintf(inst->loading_status, sizeof(inst->loading_status), "Booting DSP...");
-    fprintf(stderr, "Virus: booting DSPs...\n");
+    /* 5. Boot DSPs */
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Booting DSP...");
+    vlog("[child] bootDSPs...");
+    virusLib::Device::bootDSPs(dsp1, dsp2, *rom, false);
+    vlog("[child] bootDSPs OK");
 
-    virusLib::Device::bootDSPs(inst->dsp, dsp2, *inst->rom, false);
-    fprintf(stderr, "Virus: DSP boot returned\n");
-
-    /* 6. Wait for DSP to finish booting.
-     * Use small 8-frame chunks (same as Device constructor's dummyProcess)
-     * and call processAudio directly — no semaphore during boot.
-     * The DSP thread is starting up and producing frames slowly
-     * during JIT compilation. */
+    /* 6. Boot drain */
     {
         constexpr int BOOT_CHUNK = 8;
         float dummy_l[BOOT_CHUNK], dummy_r[BOOT_CHUNK];
@@ -578,128 +403,245 @@ static void* boot_thread_func(void *arg) {
         outputs[0] = dummy_l; outputs[1] = dummy_r;
 
         int retries = 0;
-        fprintf(stderr, "Virus: waiting for DSP boot (model=%d)...\n",
-                (int)inst->rom->getModel());
-
-        if (inst->rom->getModel() == virusLib::DeviceModel::A) {
-            /* Model A never signals dspHasBooted — just process 32 chunks */
-            for (int i = 0; i < 32; i++) {
-                if (inst->shutting_down) goto cleanup_and_exit;
-                inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
-            }
-            inst->dsp->disableESSI1();
+        if (rom->getModel() == virusLib::DeviceModel::A) {
+            for (int i = 0; i < 32; i++)
+                dsp1->processAudio(inputs, outputs, BOOT_CHUNK, 0);
+            dsp1->disableESSI1();
             retries = 32;
         } else {
-            /* Model B/C: wait for boot signal with timeout */
-            while (!inst->mc->dspHasBooted() && retries < 512) {
-                if (inst->shutting_down) {
-                    fprintf(stderr, "Virus: abort during boot wait\n");
-                    goto cleanup_and_exit;
-                }
-                inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
+            while (!mc->dspHasBooted() && retries < 512) {
+                if (shm->child_shutdown) goto cleanup;
+                dsp1->processAudio(inputs, outputs, BOOT_CHUNK, 0);
                 retries++;
             }
         }
-        fprintf(stderr, "Virus: DSP booted after %d drain cycles (%d frames)\n",
-                retries, retries * BOOT_CHUNK);
+        vlog("[child] boot drain: %d cycles (%d frames)", retries, retries * BOOT_CHUNK);
 
-        /* Run at full DSP clock. Model A needs ~66 MIPS (achievable),
-         * Model B needs ~108 MIPS (marginal on Move hardware). */
-        fprintf(stderr, "Virus: DSP clock at 100%% (model=%s)\n",
-                inst->rom->getModelName().c_str());
-
-        /* 7. Initialize (mirrors Device constructor post-boot sequence) */
-        inst->mc->sendInitControlCommands(127);
-
-        /* Process to let init commands settle */
-        for (int i = 0; i < 8; i++) {
-            if (inst->shutting_down) goto cleanup_and_exit;
-            inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
-        }
-
-        inst->mc->createDefaultState();
-
-        /* Process a few more blocks after default state */
-        for (int i = 0; i < 8; i++) {
-            if (inst->shutting_down) goto cleanup_and_exit;
-            inst->dsp->processAudio(inputs, outputs, BOOT_CHUNK, 0);
-        }
+        /* 7. Initialize */
+        mc->sendInitControlCommands(127);
+        for (int i = 0; i < 8; i++)
+            dsp1->processAudio(inputs, outputs, BOOT_CHUNK, 0);
+        mc->createDefaultState();
+        for (int i = 0; i < 8; i++)
+            dsp1->processAudio(inputs, outputs, BOOT_CHUNK, 0);
     }
-
-    fprintf(stderr, "Virus: DSP initialized successfully\n");
+    vlog("[child] DSP initialized");
 
     /* 8. Set up presets */
-    inst->bank_count = virusLib::ROMFile::getRomBankCount(inst->rom->getModel());
-    inst->preset_count = inst->rom->getPresetsPerBank();
-    inst->current_bank = 0;
-    inst->current_preset = 0;
-    update_bank_name(inst);
-    update_preset_name(inst);
+    shm->bank_count = virusLib::ROMFile::getRomBankCount(rom->getModel());
+    shm->preset_count = rom->getPresetsPerBank();
+    shm->current_bank = 0;
+    shm->current_preset = 0;
+    snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank A");
+    child_update_preset_name(shm, rom);
 
-    /* Send initial preset via MIDI */
-    {
+    { /* Initial preset via MIDI */
         synthLib::SMidiEvent bankSel(synthLib::MidiEventSource::Host, 0xB0, 0, 0);
-        inst->mc->sendMIDI(bankSel);
+        mc->sendMIDI(bankSel);
         synthLib::SMidiEvent progChg(synthLib::MidiEventSource::Host, 0xC0, 0, 0);
-        inst->mc->sendMIDI(progChg);
+        mc->sendMIDI(progChg);
     }
 
-    /* 9. Pre-fill ring buffer (direct processAudio, no semaphore) */
-    snprintf(inst->loading_status, sizeof(inst->loading_status), "Warming up...");
-    inst->ring_read = 0;
-    inst->ring_write = 0;
-
+    /* 9. Pre-fill ring buffer */
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Warming up...");
     {
-        float wl[EMU_CHUNK], wr[EMU_CHUNK];
+        float wl[EMU_CHUNK], wr_buf[EMU_CHUNK];
         synthLib::TAudioInputs inputs = {};
         synthLib::TAudioOutputs outputs = {};
-        outputs[0] = wl; outputs[1] = wr;
+        outputs[0] = wl; outputs[1] = wr_buf;
 
-        for (int fill = 0; fill < 4 && ring_free(inst) >= EMU_CHUNK; fill++) {
-            inst->dsp->processAudio(inputs, outputs, EMU_CHUNK, 0);
-            int wr_pos = inst->ring_write;
+        for (int fill = 0; fill < 4 && shm_ring_free(shm) >= EMU_CHUNK; fill++) {
+            dsp1->processAudio(inputs, outputs, EMU_CHUNK, 0);
+            int wr = shm->ring_write;
             for (int i = 0; i < EMU_CHUNK; i++) {
                 int32_t l = (int32_t)(wl[i] * 32767.0f);
-                int32_t r = (int32_t)(wr[i] * 32767.0f);
+                int32_t r = (int32_t)(wr_buf[i] * 32767.0f);
                 if (l > 32767) l = 32767; if (l < -32768) l = -32768;
                 if (r > 32767) r = 32767; if (r < -32768) r = -32768;
-                inst->audio_ring[wr_pos * 2 + 0] = (int16_t)l;
-                inst->audio_ring[wr_pos * 2 + 1] = (int16_t)r;
-                wr_pos = (wr_pos + 1) % AUDIO_RING_SIZE;
+                shm->audio_ring[wr * 2 + 0] = (int16_t)l;
+                shm->audio_ring[wr * 2 + 1] = (int16_t)r;
+                wr = (wr + 1) % AUDIO_RING_SIZE;
             }
-            inst->ring_write = wr_pos;
+            shm->ring_write = wr;
         }
     }
-    fprintf(stderr, "Virus: pre-filled %d frames\n", ring_available(inst));
+    vlog("[child] pre-filled %d frames", shm_ring_available(shm));
 
-    /* Drain semaphore signals accumulated during boot.
-     * Replace with a fresh semaphore so the emu thread starts clean. */
-    delete inst->audio_sem;
-    inst->audio_sem = new dsp56k::SpscSemaphore(1);
-    inst->notify_timeout.store(0);
+    /* 10. Signal ready and enter emu loop */
+    shm->initialized = 1;
+    shm->loading_complete = 1;
+    shm->child_ready = 1;
+    sem_active.store(true);
+    notify_timeout.store(0);
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status),
+             "Ready: %d banks, %d presets/bank", shm->bank_count, shm->preset_count);
+    vlog("[child] READY! entering emu loop");
 
-    /* 10. Start emu thread */
-    inst->emu_thread_running = 1;
-    inst->initialized = 1;
-    pthread_create(&inst->emu_thread, nullptr, emu_thread_func, inst);
+    /* === Emu loop (runs until shutdown) === */
+    {
+        shm->prof_start_us = now_us();
+        float proc_l[EMU_CHUNK], proc_r[EMU_CHUNK];
+        double resample_phase = 0.0;
+        float resample_prev_l = 0.0f, resample_prev_r = 0.0f;
 
-    inst->loading_complete = 1;
-    snprintf(inst->loading_status, sizeof(inst->loading_status),
-             "Ready: %d banks, %d presets/bank", inst->bank_count, inst->preset_count);
+        while (!shm->child_shutdown) {
+            /* Process incoming MIDI from parent */
+            child_process_midi_fifo(shm, mc);
 
-    if (inst->pending_state_valid && inst->pending_state) {
-        fprintf(stderr, "Virus: applying deferred state\n");
-        inst->pending_state_valid = 0;
+            /* Wait for ring buffer space */
+            if (shm_ring_free(shm) < RESAMPLE_MAX_OUT) {
+                usleep(200);
+                continue;
+            }
+
+            /* Wait for DSP to produce enough frames */
+            audio_sem.wait();
+            if (shm->child_shutdown) break;
+
+            synthLib::TAudioInputs inputs = {};
+            synthLib::TAudioOutputs outputs = {};
+            outputs[0] = proc_l; outputs[1] = proc_r;
+
+            int64_t t0 = now_us();
+            dsp1->processAudio(inputs, outputs, EMU_CHUNK, EMU_CHUNK);
+            int64_t dt = now_us() - t0;
+            shm->prof_process_us_total += dt;
+            if ((int)dt > shm->prof_process_max_us) shm->prof_process_max_us = (int)dt;
+            shm->emu_blocks++;
+            shm->child_alive++;
+
+            /* Peak tracking */
+            for (int i = 0; i < EMU_CHUNK; i++) {
+                float peak = fabsf(proc_l[i]);
+                float pr = fabsf(proc_r[i]);
+                if (pr > peak) peak = pr;
+                if (peak > shm->prof_peak_level) shm->prof_peak_level = peak;
+            }
+
+            /* Periodic stats */
+            if ((shm->emu_blocks % 1465) == 1) {
+                int64_t now = now_us();
+                double elapsed_s = (now - shm->prof_start_us) / 1000000.0;
+                double mips = 0;
+                if (elapsed_s > 0.1)
+                    mips = (double)shm->emu_blocks * EMU_CHUNK * 2304.0 / elapsed_s / 1000000.0;
+                vlog("[child] blk=%d buf=%d ur=%d mips=%.1f peak=%.3f",
+                     shm->emu_blocks, shm_ring_available(shm), shm->underrun_count, mips,
+                     (double)shm->prof_peak_level);
+                shm->prof_peak_level = 0.0f;
+            }
+
+            /* Resample 46875→44100 */
+            float ext_l[EMU_CHUNK + 1], ext_r[EMU_CHUNK + 1];
+            ext_l[0] = resample_prev_l; ext_r[0] = resample_prev_r;
+            memcpy(ext_l + 1, proc_l, EMU_CHUNK * sizeof(float));
+            memcpy(ext_r + 1, proc_r, EMU_CHUNK * sizeof(float));
+
+            int16_t resampled[RESAMPLE_MAX_OUT * 2];
+            int out_count = 0;
+            while (resample_phase < (double)EMU_CHUNK && out_count < RESAMPLE_MAX_OUT) {
+                double ext_pos = resample_phase + 1.0;
+                int idx = (int)ext_pos;
+                double frac = ext_pos - idx;
+                if (idx >= EMU_CHUNK) break;
+                float l = ext_l[idx] * (float)(1.0 - frac) + ext_l[idx + 1] * (float)frac;
+                float r = ext_r[idx] * (float)(1.0 - frac) + ext_r[idx + 1] * (float)frac;
+                int32_t li = (int32_t)(l * OUTPUT_GAIN * 32767.0f);
+                int32_t ri = (int32_t)(r * OUTPUT_GAIN * 32767.0f);
+                if (li > 32767) li = 32767; if (li < -32768) li = -32768;
+                if (ri > 32767) ri = 32767; if (ri < -32768) ri = -32768;
+                resampled[out_count * 2 + 0] = (int16_t)li;
+                resampled[out_count * 2 + 1] = (int16_t)ri;
+                out_count++;
+                resample_phase += RESAMPLE_RATIO;
+            }
+            resample_phase -= (double)EMU_CHUNK;
+            resample_prev_l = proc_l[EMU_CHUNK - 1];
+            resample_prev_r = proc_r[EMU_CHUNK - 1];
+
+            /* Write to shared ring buffer */
+            if (shm_ring_free(shm) < out_count) continue;
+            int wr = shm->ring_write;
+            for (int i = 0; i < out_count; i++) {
+                shm->audio_ring[wr * 2 + 0] = resampled[i * 2 + 0];
+                shm->audio_ring[wr * 2 + 1] = resampled[i * 2 + 1];
+                wr = (wr + 1) % AUDIO_RING_SIZE;
+            }
+            shm->ring_write = wr;
+        }
     }
 
-    inst->capture_armed = 1;
-    fprintf(stderr, "Virus: ready! (semaphore mode, no Device/Plugin wrapper)\n");
-    inst->boot_thread_running = 0;
-    return nullptr;
-
-cleanup_and_exit:
-    /* Shutdown requested during boot */
+cleanup:
+    vlog("[child] shutting down");
     audio.setCallback(nullptr, 0);
+    audio.terminate();
+    delete mc;
+    delete dsp1;
+    delete rom;
+    vlog("[child] exiting");
+}
+
+/* =====================================================================
+ * Boot thread (parent process — forks the child)
+ * ===================================================================== */
+
+static void* boot_thread_func(void *arg) {
+    virus_instance_t *inst = (virus_instance_t*)arg;
+    virus_shm_t *shm = inst->shm;
+
+    vlog("boot thread: waiting 3s for system to stabilize...");
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Waiting...");
+    for (int i = 0; i < 3; i++) sleep(1);
+
+    vlog("boot thread: forking child process for DSP...");
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf((char*)shm->load_error, sizeof(shm->load_error), "fork() failed: %s", strerror(errno));
+        shm->initialized = 1; shm->loading_complete = 1;
+        inst->boot_thread_running = 0;
+        return nullptr;
+    }
+
+    if (pid == 0) {
+        /* === CHILD PROCESS === */
+        /* Close parent's vlog FILE handle */
+        if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
+
+        child_main(shm);
+        _exit(0);  /* Use _exit to avoid running atexit handlers */
+    }
+
+    /* === PARENT PROCESS === */
+    inst->child_pid = pid;
+    vlog("boot thread: child forked, pid=%d", (int)pid);
+
+    /* Wait for child to signal ready (poll with timeout) */
+    for (int i = 0; i < 600 && !shm->child_ready; i++) {
+        /* Check if child died */
+        int status;
+        pid_t res = waitpid(pid, &status, WNOHANG);
+        if (res == pid) {
+            snprintf((char*)shm->load_error, sizeof(shm->load_error),
+                     "DSP process exited unexpectedly (status=%d)", status);
+            shm->initialized = 1; shm->loading_complete = 1;
+            inst->child_pid = 0;
+            inst->boot_thread_running = 0;
+            vlog("boot thread: child died during boot, status=%d", status);
+            return nullptr;
+        }
+        usleep(100000); /* 100ms */
+    }
+
+    if (!shm->child_ready) {
+        snprintf((char*)shm->load_error, sizeof(shm->load_error), "DSP boot timed out (60s)");
+        shm->initialized = 1; shm->loading_complete = 1;
+        kill(pid, SIGTERM);
+        waitpid(pid, nullptr, 0);
+        inst->child_pid = 0;
+    }
+
+    vlog("boot thread: child ready, boot complete");
     inst->boot_thread_running = 0;
     return nullptr;
 }
@@ -708,19 +650,33 @@ cleanup_and_exit:
  * Plugin API v2
  * ===================================================================== */
 
-static void v2_set_param(void *instance, const char *key, const char *val);
-
 static void* v2_create_instance(const char *module_dir, const char *json_defaults) {
     (void)json_defaults;
+
     virus_instance_t *inst = (virus_instance_t*)calloc(1, sizeof(virus_instance_t));
     if (!inst) return nullptr;
-    strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
-    fprintf(stderr, "Virus: creating instance from %s\n", module_dir);
-    snprintf(inst->loading_status, sizeof(inst->loading_status), "Initializing...");
-    inst->cc_values[74] = 127;
-    inst->cc_values[75] = 64;
-    inst->cc_values[76] = 64;
-    inst->cc_values[72] = 64;
+
+    /* Allocate shared memory (MAP_SHARED so it persists across fork) */
+    inst->shm = (virus_shm_t*)mmap(nullptr, sizeof(virus_shm_t),
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (inst->shm == MAP_FAILED) {
+        fprintf(stderr, "Virus: mmap failed: %s\n", strerror(errno));
+        free(inst);
+        return nullptr;
+    }
+    memset(inst->shm, 0, sizeof(virus_shm_t));
+    strncpy((char*)inst->shm->module_dir, module_dir, sizeof(inst->shm->module_dir) - 1);
+
+    /* Set default CC values */
+    inst->shm->cc_values[74] = 127;
+    inst->shm->cc_values[75] = 64;
+    inst->shm->cc_values[76] = 64;
+    inst->shm->cc_values[72] = 64;
+
+    fprintf(stderr, "Virus: creating instance from %s (fork mode)\n", module_dir);
+    snprintf((char*)inst->shm->loading_status, sizeof(inst->shm->loading_status), "Initializing...");
+
     inst->boot_thread_running = 1;
     pthread_create(&inst->boot_thread, nullptr, boot_thread_func, inst);
     return inst;
@@ -731,38 +687,30 @@ static void v2_destroy_instance(void *instance) {
     if (!inst) return;
     fprintf(stderr, "Virus: destroying\n");
 
-    /* Signal shutdown to boot thread */
-    inst->shutting_down = 1;
-
-    /* Stop emu thread */
-    if (inst->emu_thread_running) {
-        inst->emu_thread_running = 0;
-        /* Unblock semaphore wait */
-        if (inst->audio_sem) inst->audio_sem->notify();
-        pthread_join(inst->emu_thread, nullptr);
-    }
+    /* Signal child to shutdown */
+    if (inst->shm) inst->shm->child_shutdown = 1;
 
     /* Wait for boot thread */
-    if (inst->boot_thread_running) {
-        /* Unblock semaphore wait during boot */
-        if (inst->audio_sem) inst->audio_sem->notify();
+    if (inst->boot_thread_running)
         pthread_join(inst->boot_thread, nullptr);
+
+    /* Kill child process */
+    if (inst->child_pid > 0) {
+        kill(inst->child_pid, SIGTERM);
+        /* Wait up to 3 seconds */
+        for (int i = 0; i < 30; i++) {
+            int status;
+            if (waitpid(inst->child_pid, &status, WNOHANG) == inst->child_pid) break;
+            usleep(100000);
+        }
+        kill(inst->child_pid, SIGKILL);
+        waitpid(inst->child_pid, nullptr, 0);
     }
 
-    /* Clear callback before destroying DSP */
-    if (inst->dsp) {
-        inst->dsp->getAudio().setCallback(nullptr, 0);
-        inst->dsp->getAudio().terminate();
-    }
+    /* Unmap shared memory */
+    if (inst->shm && inst->shm != MAP_FAILED)
+        munmap(inst->shm, sizeof(virus_shm_t));
 
-    /* Destroy in reverse order */
-    if (inst->mc) { delete inst->mc; inst->mc = nullptr; }
-    if (inst->dsp) { delete inst->dsp; inst->dsp = nullptr; }
-    if (inst->rom) { delete inst->rom; inst->rom = nullptr; }
-    if (inst->audio_sem) { delete inst->audio_sem; inst->audio_sem = nullptr; }
-
-    if (inst->capture_emu_file) { wav_close(inst->capture_emu_file, inst->capture_frames_written); }
-    if (inst->capture_render_file) { wav_close(inst->capture_render_file, inst->capture_frames_written); }
     if (inst->pending_state) free(inst->pending_state);
     free(inst);
     fprintf(stderr, "Virus: destroyed\n");
@@ -770,34 +718,28 @@ static void v2_destroy_instance(void *instance) {
 
 static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) {
     virus_instance_t *inst = (virus_instance_t*)instance;
-    if (!inst || !inst->initialized || !inst->mc || len < 1) return;
+    if (!inst || !inst->shm || !inst->shm->initialized || len < 1) return;
     (void)source;
-    uint8_t status = msg[0] & 0xF0;
+
     uint8_t modified[8];
     int n = len > 8 ? 8 : len;
     memcpy(modified, msg, n);
 
-    if (status == 0x90 && len >= 3 && msg[2] > 0 && inst->capture_armed) {
-        inst->capture_armed = 0;
-        char ep[512], rp[512];
-        snprintf(ep, sizeof(ep), "%s/capture_emu.wav", inst->module_dir);
-        snprintf(rp, sizeof(rp), "%s/capture_render.wav", inst->module_dir);
-        inst->capture_emu_file = wav_open(ep);
-        inst->capture_render_file = wav_open(rp);
-        inst->capture_frames_written = 0;
-        inst->capture_max_frames = CAPTURE_MAX_FRAMES;
-        fprintf(stderr, "Virus: capture started\n");
-    }
+    uint8_t status = msg[0] & 0xF0;
 
+    /* Apply octave transpose to notes */
     if ((status == 0x90 || status == 0x80) && len >= 2) {
-        int note = msg[1] + inst->octave_transpose * 12;
+        int note = msg[1] + inst->shm->octave_transpose * 12;
         if (note < 0) note = 0; if (note > 127) note = 127;
         modified[1] = (uint8_t)note;
     }
-    if (status == 0xB0 && len >= 3)
-        inst->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
 
-    send_midi_to_mc(inst, modified, n);
+    /* Track CC values locally too */
+    if (status == 0xB0 && len >= 3)
+        inst->shm->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
+
+    /* Push to shared MIDI FIFO for child to consume */
+    midi_fifo_push(inst->shm, modified, n);
 }
 
 static int json_get_int(const char *json, const char *key, int *out) {
@@ -813,85 +755,75 @@ static int json_get_int(const char *json, const char *key, int *out) {
 
 static void v2_set_param(void *instance, const char *key, const char *val) {
     virus_instance_t *inst = (virus_instance_t*)instance;
-    if (!inst) return;
+    if (!inst || !inst->shm) return;
+    virus_shm_t *shm = inst->shm;
 
     if (strcmp(key, "state") == 0) {
-        if (!inst->loading_complete) {
+        if (!shm->loading_complete) {
             if (inst->pending_state) free(inst->pending_state);
             inst->pending_state = strdup(val);
             inst->pending_state_valid = 1;
             return;
         }
         int ival;
-        if (json_get_int(val, "bank", &ival) == 0 && ival >= 0 && ival < inst->bank_count) {
-            inst->current_bank = ival; update_bank_name(inst);
+        if (json_get_int(val, "bank", &ival) == 0 && ival >= 0 && ival < shm->bank_count) {
+            shm->current_bank = ival;
+            snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank %c", 'A' + ival);
         }
-        if (json_get_int(val, "preset", &ival) == 0 && ival >= 0 && ival < inst->preset_count) {
-            inst->current_preset = ival;
-            send_cc(inst, 0, inst->current_bank);
-            uint8_t pc[2] = { 0xC0, (uint8_t)inst->current_preset };
-            send_midi_to_mc(inst, pc, 2);
-            update_preset_name(inst);
+        if (json_get_int(val, "preset", &ival) == 0 && ival >= 0 && ival < shm->preset_count) {
+            shm->current_preset = ival;
+            uint8_t cc0[3] = { 0xB0, 0, (uint8_t)shm->current_bank };
+            midi_fifo_push(shm, cc0, 3);
+            uint8_t pc[2] = { 0xC0, (uint8_t)shm->current_preset };
+            midi_fifo_push(shm, pc, 2);
         }
         if (json_get_int(val, "octave_transpose", &ival) == 0) {
-            inst->octave_transpose = ival;
-            if (inst->octave_transpose < -4) inst->octave_transpose = -4;
-            if (inst->octave_transpose > 4) inst->octave_transpose = 4;
+            if (ival < -4) ival = -4; if (ival > 4) ival = 4;
+            shm->octave_transpose = ival;
         }
         for (int i = 0; i < NUM_PARAMS; i++) {
             if (json_get_int(val, g_params[i].key, &ival) == 0) {
                 if (ival < g_params[i].min_val) ival = g_params[i].min_val;
                 if (ival > g_params[i].max_val) ival = g_params[i].max_val;
-                send_cc(inst, g_params[i].cc, ival);
+                uint8_t cc[3] = { 0xB0, (uint8_t)g_params[i].cc, (uint8_t)ival };
+                midi_fifo_push(shm, cc, 3);
             }
         }
         return;
     }
     if (strcmp(key, "preset") == 0) {
         int idx = atoi(val);
-        if (idx >= 0 && idx < inst->preset_count && inst->mc) {
-            inst->current_preset = idx;
-            send_cc(inst, 0, inst->current_bank);
-            uint8_t pc[2] = { 0xC0, (uint8_t)inst->current_preset };
-            send_midi_to_mc(inst, pc, 2);
-            update_preset_name(inst);
+        if (idx >= 0 && idx < shm->preset_count) {
+            shm->current_preset = idx;
+            uint8_t cc0[3] = { 0xB0, 0, (uint8_t)shm->current_bank };
+            midi_fifo_push(shm, cc0, 3);
+            uint8_t pc[2] = { 0xC0, (uint8_t)idx };
+            midi_fifo_push(shm, pc, 2);
         }
         return;
     }
     if (strcmp(key, "bank_index") == 0) {
         int idx = atoi(val);
-        if (idx >= 0 && idx < inst->bank_count) {
-            inst->current_bank = idx; update_bank_name(inst);
-            inst->current_preset = 0;
-            send_cc(inst, 0, inst->current_bank);
+        if (idx >= 0 && idx < shm->bank_count) {
+            shm->current_bank = idx;
+            shm->current_preset = 0;
+            snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank %c", 'A' + idx);
+            uint8_t cc0[3] = { 0xB0, 0, (uint8_t)idx };
+            midi_fifo_push(shm, cc0, 3);
             uint8_t pc[2] = { 0xC0, 0 };
-            send_midi_to_mc(inst, pc, 2);
-            update_preset_name(inst);
+            midi_fifo_push(shm, pc, 2);
         }
         return;
     }
     if (strcmp(key, "octave_transpose") == 0) {
-        inst->octave_transpose = atoi(val);
-        if (inst->octave_transpose < -4) inst->octave_transpose = -4;
-        if (inst->octave_transpose > 4) inst->octave_transpose = 4;
+        int v = atoi(val);
+        if (v < -4) v = -4; if (v > 4) v = 4;
+        shm->octave_transpose = v;
         return;
     }
     if (strcmp(key, "all_notes_off") == 0) {
         uint8_t msg[3] = { 0xB0, 123, 0 };
-        send_midi_to_mc(inst, msg, 3);
-        return;
-    }
-    if (strcmp(key, "capture") == 0) {
-        if (!inst->loading_complete || !inst->emu_thread_running) return;
-        if (inst->capture_emu_file || inst->capture_render_file) return;
-        char ep[512], rp[512];
-        snprintf(ep, sizeof(ep), "%s/capture_emu.wav", inst->module_dir);
-        snprintf(rp, sizeof(rp), "%s/capture_render.wav", inst->module_dir);
-        inst->capture_emu_file = wav_open(ep);
-        inst->capture_render_file = wav_open(rp);
-        inst->capture_frames_written = 0;
-        inst->capture_max_frames = CAPTURE_MAX_FRAMES;
-        fprintf(stderr, "Virus: capture started\n");
+        midi_fifo_push(shm, msg, 3);
         return;
     }
     for (int i = 0; i < NUM_PARAMS; i++) {
@@ -899,7 +831,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             int ival = atoi(val);
             if (ival < g_params[i].min_val) ival = g_params[i].min_val;
             if (ival > g_params[i].max_val) ival = g_params[i].max_val;
-            send_cc(inst, g_params[i].cc, ival);
+            uint8_t cc[3] = { 0xB0, (uint8_t)g_params[i].cc, (uint8_t)ival };
+            midi_fifo_push(shm, cc, 3);
             return;
         }
     }
@@ -907,51 +840,49 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
 static int v2_get_param(void *instance, const char *key, char *buf, int buf_len) {
     virus_instance_t *inst = (virus_instance_t*)instance;
-    if (!inst) return -1;
+    if (!inst || !inst->shm) return -1;
+    virus_shm_t *shm = inst->shm;
 
-    if (strcmp(key, "preset") == 0) return snprintf(buf, buf_len, "%d", inst->current_preset);
-    if (strcmp(key, "preset_count") == 0) return snprintf(buf, buf_len, "%d", inst->preset_count);
-    if (strcmp(key, "preset_name") == 0) return snprintf(buf, buf_len, "%s", inst->preset_name);
+    if (strcmp(key, "preset") == 0) return snprintf(buf, buf_len, "%d", shm->current_preset);
+    if (strcmp(key, "preset_count") == 0) return snprintf(buf, buf_len, "%d", shm->preset_count);
+    if (strcmp(key, "preset_name") == 0) return snprintf(buf, buf_len, "%s", (const char*)shm->preset_name);
     if (strcmp(key, "name") == 0) return snprintf(buf, buf_len, "Virus");
-    if (strcmp(key, "bank_index") == 0) return snprintf(buf, buf_len, "%d", inst->current_bank);
-    if (strcmp(key, "bank_count") == 0) return snprintf(buf, buf_len, "%d", inst->bank_count);
-    if (strcmp(key, "bank_name") == 0) return snprintf(buf, buf_len, "%s", inst->bank_name);
-    if (strcmp(key, "patch_in_bank") == 0) return snprintf(buf, buf_len, "%d", inst->current_preset + 1);
-    if (strcmp(key, "octave_transpose") == 0) return snprintf(buf, buf_len, "%d", inst->octave_transpose);
-    if (strcmp(key, "loading_status") == 0) return snprintf(buf, buf_len, "%s", inst->loading_status);
+    if (strcmp(key, "bank_index") == 0) return snprintf(buf, buf_len, "%d", shm->current_bank);
+    if (strcmp(key, "bank_count") == 0) return snprintf(buf, buf_len, "%d", shm->bank_count);
+    if (strcmp(key, "bank_name") == 0) return snprintf(buf, buf_len, "%s", (const char*)shm->bank_name);
+    if (strcmp(key, "patch_in_bank") == 0) return snprintf(buf, buf_len, "%d", shm->current_preset + 1);
+    if (strcmp(key, "octave_transpose") == 0) return snprintf(buf, buf_len, "%d", shm->octave_transpose);
+    if (strcmp(key, "loading_status") == 0) return snprintf(buf, buf_len, "%s", (const char*)shm->loading_status);
     if (strcmp(key, "debug_info") == 0) {
-        int avail = ring_available(inst);
-        int blocks = inst->emu_blocks > 0 ? inst->emu_blocks : 1;
+        int avail = shm_ring_available(shm);
+        int blocks = shm->emu_blocks > 0 ? shm->emu_blocks : 1;
         return snprintf(buf, buf_len,
-            "buf=%d min=%d ur=%d blk=%d "
-            "proc_avg=%lld proc_max=%d peak=%.2f",
-            avail, inst->prof_ring_min, inst->underrun_count, inst->emu_blocks,
-            (long long)(inst->prof_process_us_total / blocks),
-            inst->prof_process_max_us,
-            (double)inst->prof_peak_level);
+            "buf=%d min=%d ur=%d blk=%d proc_avg=%lld proc_max=%d peak=%.2f pid=%d",
+            avail, shm->prof_ring_min, shm->underrun_count, shm->emu_blocks,
+            (long long)(shm->prof_process_us_total / blocks),
+            shm->prof_process_max_us,
+            (double)shm->prof_peak_level,
+            (int)inst->child_pid);
     }
     if (strcmp(key, "prof_reset") == 0) {
-        inst->prof_poll_us_total = 0;
-        inst->prof_process_us_total = 0;
-        inst->prof_timeout_count = 0;
-        inst->prof_ring_min = AUDIO_RING_SIZE;
-        inst->prof_poll_max_us = 0;
-        inst->prof_process_max_us = 0;
-        inst->prof_peak_level = 0.0f;
-        inst->underrun_count = 0;
-        inst->emu_blocks = 0;
+        shm->prof_process_us_total = 0;
+        shm->prof_ring_min = AUDIO_RING_SIZE;
+        shm->prof_process_max_us = 0;
+        shm->prof_peak_level = 0.0f;
+        shm->underrun_count = 0;
+        shm->emu_blocks = 0;
         return snprintf(buf, buf_len, "reset");
     }
     for (int i = 0; i < NUM_PARAMS; i++)
         if (strcmp(key, g_params[i].key) == 0)
-            return snprintf(buf, buf_len, "%d", inst->cc_values[g_params[i].cc]);
+            return snprintf(buf, buf_len, "%d", shm->cc_values[g_params[i].cc]);
 
     if (strcmp(key, "state") == 0) {
         int off = 0;
         off += snprintf(buf+off, buf_len-off, "{\"bank\":%d,\"preset\":%d,\"octave_transpose\":%d",
-            inst->current_bank, inst->current_preset, inst->octave_transpose);
+            shm->current_bank, shm->current_preset, shm->octave_transpose);
         for (int i = 0; i < NUM_PARAMS; i++)
-            off += snprintf(buf+off, buf_len-off, ",\"%s\":%d", g_params[i].key, inst->cc_values[g_params[i].cc]);
+            off += snprintf(buf+off, buf_len-off, ",\"%s\":%d", g_params[i].key, shm->cc_values[g_params[i].cc]);
         off += snprintf(buf+off, buf_len-off, "}");
         return off;
     }
@@ -978,50 +909,35 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
 
 static int v2_get_error(void *instance, char *buf, int buf_len) {
     virus_instance_t *inst = (virus_instance_t*)instance;
-    if (!inst || inst->load_error[0] == '\0') return 0;
-    return snprintf(buf, buf_len, "%s", inst->load_error);
+    if (!inst || !inst->shm || inst->shm->load_error[0] == '\0') return 0;
+    return snprintf(buf, buf_len, "%s", (const char*)inst->shm->load_error);
 }
 
 static void v2_render_block(void *instance, int16_t *out, int frames) {
     virus_instance_t *inst = (virus_instance_t*)instance;
-    if (!inst || !inst->loading_complete || !inst->emu_thread_running) {
+    if (!inst || !inst->shm || !inst->shm->loading_complete || !inst->shm->child_ready) {
         memset(out, 0, frames * 2 * sizeof(int16_t));
         return;
     }
+    virus_shm_t *shm = inst->shm;
 
-    int avail = ring_available(inst);
-    if (inst->prof_ring_min == 0 || avail < inst->prof_ring_min)
-        inst->prof_ring_min = avail;
+    int avail = shm_ring_available(shm);
+    if (shm->prof_ring_min == 0 || avail < shm->prof_ring_min)
+        shm->prof_ring_min = avail;
     int to_read = (avail < frames) ? avail : frames;
-    int rd = inst->ring_read;
+    int rd = shm->ring_read;
     for (int i = 0; i < to_read; i++) {
-        out[i*2+0] = inst->audio_ring[rd*2+0];
-        out[i*2+1] = inst->audio_ring[rd*2+1];
+        out[i*2+0] = shm->audio_ring[rd*2+0];
+        out[i*2+1] = shm->audio_ring[rd*2+1];
         rd = (rd + 1) % AUDIO_RING_SIZE;
     }
-    inst->ring_read = rd;
+    shm->ring_read = rd;
 
     if (to_read < frames) {
-        inst->underrun_count++;
+        shm->underrun_count++;
         memset(out + to_read * 2, 0, (frames - to_read) * 2 * sizeof(int16_t));
     }
-    inst->render_count++;
-
-    if (inst->capture_render_file && inst->capture_frames_written < inst->capture_max_frames) {
-        int to_cap = frames;
-        if (inst->capture_frames_written + to_cap > inst->capture_max_frames)
-            to_cap = inst->capture_max_frames - inst->capture_frames_written;
-        fwrite(out, sizeof(int16_t) * 2, to_cap, inst->capture_render_file);
-        inst->capture_frames_written += to_cap;
-        if (inst->capture_frames_written >= inst->capture_max_frames) {
-            fprintf(stderr, "Virus: capture done (%d frames)\n", inst->capture_frames_written);
-            wav_close(inst->capture_emu_file, inst->capture_frames_written);
-            wav_close(inst->capture_render_file, inst->capture_frames_written);
-            inst->capture_emu_file = nullptr;
-            inst->capture_render_file = nullptr;
-            inst->capture_max_frames = 0;
-        }
-    }
+    shm->render_count++;
 }
 
 /* =====================================================================
