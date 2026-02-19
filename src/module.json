@@ -2,7 +2,7 @@
     "id": "virus",
     "name": "Virus",
     "abbrev": "VR",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Access Virus DSP56300 emulator (Gearmulator)",
     "author": "dsp56300/gearmulator",
     "ui": "ui.js",
