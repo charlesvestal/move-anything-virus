@@ -27,6 +27,10 @@ Then place your Virus ROM file in the module's `roms/` directory on the device:
 
 - **Virus A** (`.mid` boot ROM format) — recommended, tested on Move hardware
 
+Example filenames: `First_A_28.mid` (OS + factory presets), `second_A_28.mid` (preset bank)
+
+The loader accepts any `.mid` or `.bin` file in the `roms/` directory. It auto-detects the model (A/B/C) from the firmware version string inside the ROM. Place both the OS file and preset file together — they will be combined automatically. If you have multiple ROMs, you can switch between them in the Settings menu.
+
 Virus B/C ROMs are not supported on Move. The Virus B/C DSP models require more processing power than the Move's Cortex-A72 can provide in real time.
 
 ## Architecture
