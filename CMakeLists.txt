@@ -32,6 +32,21 @@ add_subdirectory(${GEARMULATOR_SOURCE}/libresample ${CMAKE_BINARY_DIR}/libresamp
 # Virus library (DSP56300-based Virus emulator)
 add_subdirectory(${GEARMULATOR_SOURCE}/virusLib ${CMAKE_BINARY_DIR}/virusLib)
 
+# MC68k emulator (needed by hardwareLib for XT/MQ)
+add_subdirectory(${GEARMULATOR_SOURCE}/mc68k ${CMAKE_BINARY_DIR}/mc68k)
+
+# Hardware library (MC68331 emulation)
+add_subdirectory(${GEARMULATOR_SOURCE}/hardwareLib ${CMAKE_BINARY_DIR}/hardwareLib)
+
+# Waldorf base library (shared by XT and MQ)
+add_subdirectory(${GEARMULATOR_SOURCE}/wLib ${CMAKE_BINARY_DIR}/wLib)
+
+# Waldorf XT / Xenia
+add_subdirectory(${GEARMULATOR_SOURCE}/xtLib ${CMAKE_BINARY_DIR}/xtLib)
+
+# Waldorf Micro Q / Vavra
+add_subdirectory(${GEARMULATOR_SOURCE}/mqLib ${CMAKE_BINARY_DIR}/mqLib)
+
 # ---- Move Anything plugin ----
 
 add_library(virus-move-plugin SHARED
@@ -56,3 +71,23 @@ set_target_properties(virus-move-plugin PROPERTIES
     PREFIX ""
     SUFFIX ".so"
 )
+
+# ---- DSP Benchmarks (headless, for testing on device) ----
+
+add_executable(bench_virus src/benchmark/dsp_bench.cpp)
+target_include_directories(bench_virus PRIVATE ${GEARMULATOR_SOURCE})
+target_compile_definitions(bench_virus PRIVATE BENCH_VIRUS=1)
+target_link_libraries(bench_virus PRIVATE virusLib synthLib baseLib)
+target_link_options(bench_virus PRIVATE -static-libstdc++ -static-libgcc)
+
+add_executable(bench_xt src/benchmark/dsp_bench.cpp)
+target_include_directories(bench_xt PRIVATE ${GEARMULATOR_SOURCE})
+target_compile_definitions(bench_xt PRIVATE BENCH_XT=1)
+target_link_libraries(bench_xt PRIVATE xtLib synthLib baseLib)
+target_link_options(bench_xt PRIVATE -static-libstdc++ -static-libgcc)
+
+add_executable(bench_mq src/benchmark/dsp_bench.cpp)
+target_include_directories(bench_mq PRIVATE ${GEARMULATOR_SOURCE})
+target_compile_definitions(bench_mq PRIVATE BENCH_MQ=1)
+target_link_libraries(bench_mq PRIVATE mqLib synthLib baseLib)
+target_link_options(bench_mq PRIVATE -static-libstdc++ -static-libgcc)

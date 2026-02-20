@@ -40,6 +40,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <atomic>
@@ -95,9 +96,9 @@ typedef struct plugin_api_v2 {
 #define DEVICE_RATE         46875.0f
 #define AUDIO_RING_SIZE     8192
 #define EMU_CHUNK           64
-#define OUTPUT_GAIN         1.0f
+#define OUTPUT_GAIN         0.7f
 #define MIDI_FIFO_SIZE      4096  /* bytes */
-#define RING_TARGET_FILL    384   /* ~8.7ms at 44100 Hz — low latency but enough buffer */
+#define RING_TARGET_FILL    768   /* ~17ms at 44100 Hz — extra headroom for note-on bursts */
 
 static const host_api_v1_t *g_host = nullptr;
 
@@ -216,6 +217,19 @@ struct virus_shm_t {
 
     /* Module directory (set by parent before fork) */
     char module_dir[256];
+
+    /* DSP clock percent (parent writes, child reads and applies) */
+    volatile int dsp_clock_percent;  /* 0 = auto (100 for A, 50 for B/C) */
+    volatile int dsp_clock_applied;  /* last value applied by child */
+    char rom_model_name[16];         /* "A", "B", "C", etc. */
+
+    /* Output gain (parent writes, child reads — applied during resample) */
+    volatile int gain_percent;       /* 0 = auto (70), else 1..100 */
+
+    /* ROM selection (child enumerates, parent selects) */
+    volatile int rom_index;          /* which ROM to load (0-based) */
+    volatile int rom_count;          /* how many ROMs found (child writes) */
+    char rom_names[8][64];           /* ROM display names (child writes) */
 };
 
 /* =====================================================================
@@ -286,8 +300,12 @@ static void child_send_midi(virusLib::Microcontroller *mc, const uint8_t *msg, i
     mc->sendMIDI(ev);
 }
 
-static void child_process_midi_fifo(virus_shm_t *shm, virusLib::Microcontroller *mc) {
-    while (midi_fifo_available(shm) > 0) {
+/* Process at most max_msgs MIDI messages per call.
+ * Rate-limiting spreads note-on voice allocation across emu blocks,
+ * preventing DSP cycle bursts that cause audio dropouts. */
+static void child_process_midi_fifo(virus_shm_t *shm, virusLib::Microcontroller *mc, int max_msgs = 2) {
+    int processed = 0;
+    while (midi_fifo_available(shm) > 0 && processed < max_msgs) {
         int rd = shm->midi_read;
         int len = shm->midi_buf[rd];
         rd = (rd + 1) % MIDI_FIFO_SIZE;
@@ -305,6 +323,7 @@ static void child_process_midi_fifo(virus_shm_t *shm, virusLib::Microcontroller 
             shm->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
 
         child_send_midi(mc, msg, len);
+        processed++;
     }
 }
 
@@ -354,13 +373,28 @@ static void child_main(virus_shm_t *shm) {
     auto roms = virusLib::ROMLoader::findROMs(std::string(roms_dir));
     if (roms.empty()) {
         snprintf((char*)shm->load_error, sizeof(shm->load_error),
-                 "No valid ROM found. Place a Virus ROM in roms/");
+                 "No Virus ROM found in roms/ directory.");
         shm->initialized = 1; shm->loading_complete = 1;
         vlog("[child] no ROM found, exiting");
         return;
     }
-    virusLib::ROMFile *rom = new virusLib::ROMFile(std::move(roms.front()));
-    vlog("[child] ROM loaded: %s model=%s", rom->getFilename().c_str(), rom->getModelName().c_str());
+
+    /* Enumerate all ROMs for the UI */
+    shm->rom_count = (int)roms.size();
+    if (shm->rom_count > 8) shm->rom_count = 8;
+    for (int i = 0; i < shm->rom_count; i++) {
+        virusLib::ROMFile tmp(virusLib::ROMFile(roms[i]));
+        snprintf(shm->rom_names[i], sizeof(shm->rom_names[i]), "Virus %s",
+                 tmp.getModelName().c_str());
+        vlog("[child] ROM[%d]: %s", i, shm->rom_names[i]);
+    }
+
+    /* Pick the selected ROM */
+    int idx = shm->rom_index;
+    if (idx < 0 || idx >= shm->rom_count) idx = 0;
+    virusLib::ROMFile *rom = new virusLib::ROMFile(std::move(roms[idx]));
+    vlog("[child] ROM loaded: %s model=%s (index %d/%d)",
+         rom->getFilename().c_str(), rom->getModelName().c_str(), idx, shm->rom_count);
 
     /* 2. Create DSP instances */
     snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Creating DSP...");
@@ -448,6 +482,21 @@ static void child_main(virus_shm_t *shm) {
     }
     vlog("[child] DSP initialized");
 
+    /* 7b. Apply DSP clock scaling.
+     * Virus A (72 MHz) runs fine at 100%. Virus B/C (108 MHz) need reduction
+     * to fit Move's A72 CPU budget. Default: 100% for A, 50% for B/C.
+     * User can override via dsp_clock param. */
+    {
+        int pct = shm->dsp_clock_percent;
+        if (pct <= 0) {
+            pct = (rom->getModel() == virusLib::DeviceModel::A) ? 100 : 40;
+        }
+        dsp1->getEsxiClock().setSpeedPercent(pct);
+        shm->dsp_clock_applied = pct;
+        vlog("[child] DSP clock set to %d%% for model %s", pct, rom->getModelName().c_str());
+    }
+    strncpy((char*)shm->rom_model_name, rom->getModelName().c_str(), sizeof(shm->rom_model_name) - 1);
+
     /* 8. Set up presets */
     shm->bank_count = virusLib::ROMFile::getRomBankCount(rom->getModel());
     shm->preset_count = rom->getPresetsPerBank();
@@ -471,7 +520,7 @@ static void child_main(virus_shm_t *shm) {
         synthLib::TAudioOutputs outputs = {};
         outputs[0] = wl; outputs[1] = wr_buf;
 
-        for (int fill = 0; fill < 4 && shm_ring_free(shm) >= EMU_CHUNK; fill++) {
+        for (int fill = 0; fill < 64 && shm_ring_free(shm) >= EMU_CHUNK; fill++) {
             dsp1->processAudio(inputs, outputs, EMU_CHUNK, 0);
             int wr = shm->ring_write;
             for (int i = 0; i < EMU_CHUNK; i++) {
@@ -539,6 +588,16 @@ static void child_main(virus_shm_t *shm) {
                 if (peak > shm->prof_peak_level) shm->prof_peak_level = peak;
             }
 
+            /* Check for dynamic clock change */
+            {
+                int want = shm->dsp_clock_percent;
+                if (want > 0 && want != shm->dsp_clock_applied) {
+                    dsp1->getEsxiClock().setSpeedPercent(want);
+                    shm->dsp_clock_applied = want;
+                    vlog("[child] DSP clock changed to %d%%", want);
+                }
+            }
+
             /* Periodic stats */
             if ((shm->emu_blocks % 1465) == 1) {
                 int64_t now = now_us();
@@ -558,6 +617,8 @@ static void child_main(virus_shm_t *shm) {
             memcpy(ext_l + 1, proc_l, EMU_CHUNK * sizeof(float));
             memcpy(ext_r + 1, proc_r, EMU_CHUNK * sizeof(float));
 
+            float gain = (shm->gain_percent > 0) ? (shm->gain_percent / 100.0f) : OUTPUT_GAIN;
+
             int16_t resampled[RESAMPLE_MAX_OUT * 2];
             int out_count = 0;
             while (resample_phase < (double)EMU_CHUNK && out_count < RESAMPLE_MAX_OUT) {
@@ -567,8 +628,8 @@ static void child_main(virus_shm_t *shm) {
                 if (idx >= EMU_CHUNK) break;
                 float l = ext_l[idx] * (float)(1.0 - frac) + ext_l[idx + 1] * (float)frac;
                 float r = ext_r[idx] * (float)(1.0 - frac) + ext_r[idx + 1] * (float)frac;
-                int32_t li = (int32_t)(l * OUTPUT_GAIN * 32767.0f);
-                int32_t ri = (int32_t)(r * OUTPUT_GAIN * 32767.0f);
+                int32_t li = (int32_t)(l * gain * 32767.0f);
+                int32_t ri = (int32_t)(r * gain * 32767.0f);
                 if (li > 32767) li = 32767; if (li < -32768) li = -32768;
                 if (ri > 32767) ri = 32767; if (ri < -32768) ri = -32768;
                 resampled[out_count * 2 + 0] = (int16_t)li;
@@ -603,8 +664,96 @@ cleanup:
 }
 
 /* =====================================================================
- * Boot thread (parent process — forks the child)
+ * Boot / restart helpers (parent process)
  * ===================================================================== */
+
+/* Fork child and wait for it to be ready. Returns 0 on success. */
+static int fork_and_wait_child(virus_instance_t *inst) {
+    virus_shm_t *shm = inst->shm;
+
+    vlog("fork_and_wait: forking child process for DSP...");
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf((char*)shm->load_error, sizeof(shm->load_error), "fork() failed: %s", strerror(errno));
+        shm->initialized = 1; shm->loading_complete = 1;
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* === CHILD PROCESS === */
+        if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
+        child_main(shm);
+        _exit(0);
+    }
+
+    /* === PARENT PROCESS === */
+    inst->child_pid = pid;
+    vlog("fork_and_wait: child forked, pid=%d", (int)pid);
+
+    for (int i = 0; i < 600 && !shm->child_ready; i++) {
+        int status;
+        pid_t res = waitpid(pid, &status, WNOHANG);
+        if (res == pid) {
+            snprintf((char*)shm->load_error, sizeof(shm->load_error),
+                     "DSP process exited unexpectedly (status=%d)", status);
+            shm->initialized = 1; shm->loading_complete = 1;
+            inst->child_pid = 0;
+            vlog("fork_and_wait: child died during boot, status=%d", status);
+            return -1;
+        }
+        usleep(100000);
+    }
+
+    if (!shm->child_ready) {
+        snprintf((char*)shm->load_error, sizeof(shm->load_error), "DSP boot timed out (60s)");
+        shm->initialized = 1; shm->loading_complete = 1;
+        kill(pid, SIGTERM);
+        waitpid(pid, nullptr, 0);
+        inst->child_pid = 0;
+        return -1;
+    }
+
+    vlog("fork_and_wait: child ready");
+    return 0;
+}
+
+/* Kill existing child and reset shm state for a fresh boot.
+ * Preserves: module_dir, rom_index, dsp_clock_percent, gain_percent */
+static void kill_child_and_reset(virus_instance_t *inst) {
+    virus_shm_t *shm = inst->shm;
+    if (inst->child_pid > 0) {
+        shm->child_shutdown = 1;
+        for (int i = 0; i < 30; i++) {
+            int status;
+            if (waitpid(inst->child_pid, &status, WNOHANG) == inst->child_pid) break;
+            usleep(100000);
+        }
+        kill(inst->child_pid, SIGKILL);
+        waitpid(inst->child_pid, nullptr, 0);
+        inst->child_pid = 0;
+    }
+
+    /* Reset transient state but keep config */
+    shm->ring_read = 0;
+    shm->ring_write = 0;
+    shm->midi_read = 0;
+    shm->midi_write = 0;
+    shm->child_ready = 0;
+    shm->child_shutdown = 0;
+    shm->child_alive = 0;
+    shm->initialized = 0;
+    shm->loading_complete = 0;
+    shm->load_error[0] = '\0';
+    shm->underrun_count = 0;
+    shm->emu_blocks = 0;
+    shm->render_count = 0;
+    shm->prof_process_us_total = 0;
+    shm->prof_process_max_us = 0;
+    shm->prof_peak_level = 0.0f;
+    shm->prof_ring_min = 0;
+    shm->dsp_clock_applied = 0;
+}
 
 static void* boot_thread_func(void *arg) {
     virus_instance_t *inst = (virus_instance_t*)arg;
@@ -614,55 +763,29 @@ static void* boot_thread_func(void *arg) {
     snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Waiting...");
     for (int i = 0; i < 3; i++) sleep(1);
 
-    vlog("boot thread: forking child process for DSP...");
+    fork_and_wait_child(inst);
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        snprintf((char*)shm->load_error, sizeof(shm->load_error), "fork() failed: %s", strerror(errno));
-        shm->initialized = 1; shm->loading_complete = 1;
-        inst->boot_thread_running = 0;
-        return nullptr;
-    }
+    vlog("boot thread: boot complete");
+    inst->boot_thread_running = 0;
+    return nullptr;
+}
 
-    if (pid == 0) {
-        /* === CHILD PROCESS === */
-        /* Close parent's vlog FILE handle */
-        if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
+/* Restart thread — kills existing child and boots a new one with different ROM */
+static void* restart_thread_func(void *arg) {
+    virus_instance_t *inst = (virus_instance_t*)arg;
+    virus_shm_t *shm = inst->shm;
 
-        child_main(shm);
-        _exit(0);  /* Use _exit to avoid running atexit handlers */
-    }
+    vlog("restart thread: killing child for ROM switch...");
+    snprintf((char*)shm->loading_status, sizeof(shm->loading_status), "Switching ROM...");
 
-    /* === PARENT PROCESS === */
-    inst->child_pid = pid;
-    vlog("boot thread: child forked, pid=%d", (int)pid);
+    kill_child_and_reset(inst);
 
-    /* Wait for child to signal ready (poll with timeout) */
-    for (int i = 0; i < 600 && !shm->child_ready; i++) {
-        /* Check if child died */
-        int status;
-        pid_t res = waitpid(pid, &status, WNOHANG);
-        if (res == pid) {
-            snprintf((char*)shm->load_error, sizeof(shm->load_error),
-                     "DSP process exited unexpectedly (status=%d)", status);
-            shm->initialized = 1; shm->loading_complete = 1;
-            inst->child_pid = 0;
-            inst->boot_thread_running = 0;
-            vlog("boot thread: child died during boot, status=%d", status);
-            return nullptr;
-        }
-        usleep(100000); /* 100ms */
-    }
+    vlog("restart thread: waiting 1s...");
+    sleep(1);
 
-    if (!shm->child_ready) {
-        snprintf((char*)shm->load_error, sizeof(shm->load_error), "DSP boot timed out (60s)");
-        shm->initialized = 1; shm->loading_complete = 1;
-        kill(pid, SIGTERM);
-        waitpid(pid, nullptr, 0);
-        inst->child_pid = 0;
-    }
+    fork_and_wait_child(inst);
 
-    vlog("boot thread: child ready, boot complete");
+    vlog("restart thread: restart complete");
     inst->boot_thread_running = 0;
     return nullptr;
 }
@@ -779,7 +902,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     virus_shm_t *shm = inst->shm;
 
     if (strcmp(key, "state") == 0) {
-        if (!shm->loading_complete) {
+        if (!shm->loading_complete || !shm->child_ready) {
             if (inst->pending_state) free(inst->pending_state);
             inst->pending_state = strdup(val);
             inst->pending_state_valid = 1;
@@ -800,6 +923,25 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (json_get_int(val, "octave_transpose", &ival) == 0) {
             if (ival < -4) ival = -4; if (ival > 4) ival = 4;
             shm->octave_transpose = ival;
+        }
+        if (json_get_int(val, "dsp_clock", &ival) == 0) {
+            if (ival < 10) ival = 10; if (ival > 100) ival = 100;
+            shm->dsp_clock_percent = ival;
+        }
+        if (json_get_int(val, "rom_index", &ival) == 0) {
+            if (ival >= 0 && (shm->rom_count == 0 || ival < shm->rom_count) && ival != shm->rom_index) {
+                shm->rom_index = ival;
+                if (shm->child_ready && !inst->boot_thread_running) {
+                    inst->boot_thread_running = 1;
+                    pthread_t t;
+                    pthread_create(&t, nullptr, restart_thread_func, inst);
+                    pthread_detach(t);
+                }
+            }
+        }
+        if (json_get_int(val, "gain", &ival) == 0) {
+            if (ival < 1) ival = 1; if (ival > 100) ival = 100;
+            shm->gain_percent = ival;
         }
         for (int i = 0; i < NUM_PARAMS; i++) {
             if (json_get_int(val, g_params[i].key, &ival) == 0) {
@@ -841,6 +983,40 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         shm->octave_transpose = v;
         return;
     }
+    if (strcmp(key, "rom_index") == 0) {
+        /* Accept either a numeric index or a ROM name string */
+        int v = -1;
+        for (int i = 0; i < shm->rom_count; i++) {
+            if (strcmp(val, shm->rom_names[i]) == 0) { v = i; break; }
+        }
+        if (v < 0) v = atoi(val);  /* fall back to numeric */
+        if (v < 0) v = 0;
+        if (shm->rom_count > 0 && v >= shm->rom_count) v = shm->rom_count - 1;
+        if (v == shm->rom_index && shm->child_ready) return; /* no change */
+        shm->rom_index = v;
+        /* Reset clock to auto so new ROM gets its appropriate default */
+        shm->dsp_clock_percent = 0;
+        /* Restart child with new ROM (in background thread) */
+        if (!inst->boot_thread_running) {
+            inst->boot_thread_running = 1;
+            pthread_t t;
+            pthread_create(&t, nullptr, restart_thread_func, inst);
+            pthread_detach(t);
+        }
+        return;
+    }
+    if (strcmp(key, "dsp_clock") == 0) {
+        int v = atoi(val);
+        if (v < 10) v = 10; if (v > 100) v = 100;
+        shm->dsp_clock_percent = v;
+        return;
+    }
+    if (strcmp(key, "gain") == 0) {
+        int v = atoi(val);
+        if (v < 1) v = 1; if (v > 100) v = 100;
+        shm->gain_percent = v;
+        return;
+    }
     if (strcmp(key, "all_notes_off") == 0) {
         uint8_t msg[3] = { 0xB0, 123, 0 };
         midi_fifo_push(shm, msg, 3);
@@ -872,6 +1048,30 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "bank_name") == 0) return snprintf(buf, buf_len, "%s", (const char*)shm->bank_name);
     if (strcmp(key, "patch_in_bank") == 0) return snprintf(buf, buf_len, "%d", shm->current_preset + 1);
     if (strcmp(key, "octave_transpose") == 0) return snprintf(buf, buf_len, "%d", shm->octave_transpose);
+    if (strcmp(key, "dsp_clock") == 0) return snprintf(buf, buf_len, "%d", shm->dsp_clock_applied > 0 ? shm->dsp_clock_applied : (shm->dsp_clock_percent > 0 ? shm->dsp_clock_percent : 40));
+    if (strcmp(key, "rom_model") == 0) return snprintf(buf, buf_len, "%s", shm->rom_model_name[0] ? (const char*)shm->rom_model_name : "?");
+    if (strcmp(key, "rom_index") == 0) {
+        int idx = shm->rom_index;
+        if (idx >= 0 && idx < shm->rom_count && shm->rom_names[idx][0])
+            return snprintf(buf, buf_len, "%s", shm->rom_names[idx]);
+        return snprintf(buf, buf_len, "%d", idx);
+    }
+    if (strcmp(key, "rom_count") == 0) return snprintf(buf, buf_len, "%d", shm->rom_count);
+    if (strcmp(key, "rom_name") == 0) {
+        int idx = shm->rom_index;
+        if (idx >= 0 && idx < shm->rom_count && shm->rom_names[idx][0])
+            return snprintf(buf, buf_len, "%s", shm->rom_names[idx]);
+        return snprintf(buf, buf_len, "---");
+    }
+    if (strcmp(key, "rom_list") == 0) {
+        int off = 0;
+        for (int i = 0; i < shm->rom_count && off < buf_len - 80; i++) {
+            if (i > 0) off += snprintf(buf+off, buf_len-off, ",");
+            off += snprintf(buf+off, buf_len-off, "%s", shm->rom_names[i]);
+        }
+        return off;
+    }
+    if (strcmp(key, "gain") == 0) return snprintf(buf, buf_len, "%d", shm->gain_percent > 0 ? shm->gain_percent : 70);
     if (strcmp(key, "loading_status") == 0) return snprintf(buf, buf_len, "%s", (const char*)shm->loading_status);
     if (strcmp(key, "debug_info") == 0) {
         int avail = shm_ring_available(shm);
@@ -901,6 +1101,9 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         int off = 0;
         off += snprintf(buf+off, buf_len-off, "{\"bank\":%d,\"preset\":%d,\"octave_transpose\":%d",
             shm->current_bank, shm->current_preset, shm->octave_transpose);
+        off += snprintf(buf+off, buf_len-off, ",\"dsp_clock\":%d,\"gain\":%d,\"rom_index\":%d",
+            shm->dsp_clock_applied > 0 ? shm->dsp_clock_applied : 40,
+            shm->gain_percent > 0 ? shm->gain_percent : 70, shm->rom_index);
         for (int i = 0; i < NUM_PARAMS; i++)
             off += snprintf(buf+off, buf_len-off, ",\"%s\":%d", g_params[i].key, shm->cc_values[g_params[i].cc]);
         off += snprintf(buf+off, buf_len-off, "}");
@@ -909,10 +1112,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "ui_hierarchy") == 0) {
         const char *h = "{\"modes\":null,\"levels\":{\"root\":{\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\",\"children\":null,"
             "\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"flt_attack\",\"flt_decay\",\"flt_sustain\",\"flt_release\",\"octave_transpose\"],"
-            "\"params\":[{\"level\":\"filter\",\"label\":\"Filter\"},{\"level\":\"amp\",\"label\":\"Amp Env\"},{\"level\":\"osc\",\"label\":\"Oscillators\"}]},"
+            "\"params\":[{\"level\":\"filter\",\"label\":\"Filter\"},{\"level\":\"amp\",\"label\":\"Amp Env\"},{\"level\":\"osc\",\"label\":\"Oscillators\"},{\"level\":\"settings\",\"label\":\"Settings\"}]},"
             "\"filter\":{\"children\":null,\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_mode\"],\"params\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_mode\"]},"
             "\"amp\":{\"children\":null,\"knobs\":[\"amp_attack\",\"amp_decay\",\"amp_sustain\",\"amp_release\"],\"params\":[\"amp_attack\",\"amp_decay\",\"amp_sustain\",\"amp_release\"]},"
-            "\"osc\":{\"children\":null,\"knobs\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"],\"params\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"]}}}";
+            "\"osc\":{\"children\":null,\"knobs\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"],\"params\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"]},"
+            "\"settings\":{\"children\":null,\"knobs\":[\"dsp_clock\",\"gain\"],"
+            "\"params\":[\"rom_index\",\"dsp_clock\",\"gain\"]}}}";
         int len = strlen(h);
         if (len < buf_len) { strcpy(buf, h); return len; }
         return -1;
@@ -921,7 +1126,17 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         int off = 0;
         off += snprintf(buf+off, buf_len-off,
             "[{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"octave_transpose\",\"name\":\"Octave\",\"type\":\"int\",\"min\":-4,\"max\":4}");
+            "{\"key\":\"octave_transpose\",\"name\":\"Octave\",\"type\":\"int\",\"min\":-4,\"max\":4},"
+            "{\"key\":\"rom_index\",\"name\":\"ROM\",\"type\":\"enum\",\"options\":[");
+        for (int i = 0; i < shm->rom_count; i++) {
+            if (i > 0) off += snprintf(buf+off, buf_len-off, ",");
+            off += snprintf(buf+off, buf_len-off, "\"%s\"", shm->rom_names[i]);
+        }
+        if (shm->rom_count == 0)
+            off += snprintf(buf+off, buf_len-off, "\"(loading)\"");
+        off += snprintf(buf+off, buf_len-off, "]},"
+            "{\"key\":\"dsp_clock\",\"name\":\"DSP Clock %%\",\"type\":\"int\",\"min\":10,\"max\":100,\"step\":5},"
+            "{\"key\":\"gain\",\"name\":\"Gain %%\",\"type\":\"int\",\"min\":1,\"max\":100}");
         for (int i = 0; i < NUM_PARAMS && off < buf_len - 100; i++)
             off += snprintf(buf+off, buf_len-off,
                 ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"int\",\"min\":%d,\"max\":%d}",
@@ -944,6 +1159,17 @@ static void v2_render_block(void *instance, int16_t *out, int frames) {
         memset(out, 0, frames * 2 * sizeof(int16_t));
         return;
     }
+
+    /* Apply pending state that arrived before child was ready */
+    if (inst->pending_state_valid && inst->pending_state) {
+        inst->pending_state_valid = 0;
+        char *state = inst->pending_state;
+        inst->pending_state = nullptr;
+        vlog("[parent] applying pending state after boot");
+        v2_set_param(instance, "state", state);
+        free(state);
+    }
+
     virus_shm_t *shm = inst->shm;
 
     int avail = shm_ring_available(shm);
