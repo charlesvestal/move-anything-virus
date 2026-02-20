@@ -379,6 +379,11 @@ static void child_main(virus_shm_t *shm) {
         return;
     }
 
+    /* Sort ROMs by model (A=0, B=1, C=2, ...) so enum goes A → B → C */
+    std::sort(roms.begin(), roms.end(), [](const virusLib::ROMFile &a, const virusLib::ROMFile &b) {
+        return static_cast<int>(a.getModel()) < static_cast<int>(b.getModel());
+    });
+
     /* Enumerate all ROMs for the UI */
     shm->rom_count = (int)roms.size();
     if (shm->rom_count > 8) shm->rom_count = 8;
@@ -484,12 +489,15 @@ static void child_main(virus_shm_t *shm) {
 
     /* 7b. Apply DSP clock scaling.
      * Virus A (72 MHz) runs fine at 100%. Virus B/C (108 MHz) need reduction
-     * to fit Move's A72 CPU budget. Default: 100% for A, 50% for B/C.
-     * User can override via dsp_clock param. */
+     * to fit Move's A72 CPU budget. User can override via dsp_clock param. */
     {
         int pct = shm->dsp_clock_percent;
         if (pct <= 0) {
-            pct = (rom->getModel() == virusLib::DeviceModel::A) ? 100 : 40;
+            switch (rom->getModel()) {
+                case virusLib::DeviceModel::A: pct = 100; break;
+                case virusLib::DeviceModel::B: pct = 45;  break;
+                default:                       pct = 35;  break; /* C and others */
+            }
         }
         dsp1->getEsxiClock().setSpeedPercent(pct);
         shm->dsp_clock_applied = pct;

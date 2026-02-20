@@ -2,7 +2,7 @@
     "id": "osirus",
     "name": "Osirus",
     "abbrev": "OS",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Access Virus DSP56300 emulator (Gearmulator)",
     "author": "dsp56300/gearmulator (port: charlesvestal)",
     "ui": "ui.js",
@@ -11,9 +11,9 @@
     "assets": {
         "path": "roms",
         "label": "ROMs",
-        "extensions": [".mid"],
-        "description": "Requires a Virus A ROM file (.mid format). Virus B/C are not supported on Move hardware.",
-        "hint": "Upload a Virus A ROM file (.mid boot ROM format). Virus B/C ROMs require too much DSP power for Move.",
+        "extensions": [".mid", ".bin", ".BIN"],
+        "description": "Place Virus A/B/C ROM files here. A runs at full quality; B/C run with reduced DSP clock.",
+        "hint": "Upload Virus ROM files (.mid or .BIN format). Multiple ROMs supported — select in Settings menu.",
         "hint_url": "https://github.com/charlesvestal/move-anything-virus",
         "hint_url_label": "Read more"
     },
