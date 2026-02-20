@@ -56,6 +56,7 @@
 #include "dsp56kEmu/semaphore.h"
 #include "synthLib/audioTypes.h"
 #include "synthLib/midiTypes.h"
+#include "program_selection.h"
 
 /* Plugin API v2 (inline definitions to avoid path issues) */
 extern "C" {
@@ -169,6 +170,9 @@ static const virus_param_t g_params[] = {
     {"patch_volume", "Volume",        91, 0, 127},
 };
 static const int NUM_PARAMS = sizeof(g_params) / sizeof(g_params[0]);
+static constexpr int VIRUS_MAX_BANKS = 32;
+static constexpr int VIRUS_MAX_PRESETS_PER_BANK = 128;
+static constexpr int VIRUS_PRESET_NAME_BYTES = 24;
 
 /* =====================================================================
  * Shared memory structure (parent <-> child process)
@@ -202,6 +206,8 @@ struct virus_shm_t {
     volatile int current_preset;
     volatile int bank_count;
     volatile int preset_count;
+    volatile int preset_name_cache_ready;
+    char preset_name_cache[VIRUS_MAX_BANKS][VIRUS_MAX_PRESETS_PER_BANK][VIRUS_PRESET_NAME_BYTES];
     volatile int octave_transpose;
     volatile int cc_values[128];
 
@@ -257,6 +263,37 @@ static int midi_fifo_free(virus_shm_t *shm) {
     return MIDI_FIFO_SIZE - 1 - midi_fifo_available(shm);
 }
 
+static uint8_t bank_index_to_midi_lsb(int bank_index, int bank_count) {
+    int idx = bank_index;
+    int max_idx = bank_count > 0 ? bank_count - 1 : 0;
+    if (idx < 0) idx = 0;
+    if (idx > max_idx) idx = max_idx;
+    int midi = idx + 1; /* Access uses 1-based bank numbers: A=1..H=8. */
+    if (midi < 1) midi = 1;
+    if (midi > 127) midi = 127;
+    return (uint8_t)midi;
+}
+
+static const char *shm_lookup_preset_name(virus_shm_t *shm, int bank, int preset) {
+    if (!shm || !shm->preset_name_cache_ready) return nullptr;
+    if (bank < 0 || preset < 0) return nullptr;
+    if (bank >= shm->bank_count || preset >= shm->preset_count) return nullptr;
+    if (bank >= VIRUS_MAX_BANKS || preset >= VIRUS_MAX_PRESETS_PER_BANK) return nullptr;
+    const char *name = shm->preset_name_cache[bank][preset];
+    if (!name[0]) return nullptr;
+    return name;
+}
+
+static void shm_refresh_current_preset_name(virus_shm_t *shm) {
+    if (!shm) return;
+    const char *name = shm_lookup_preset_name(shm, shm->current_bank, shm->current_preset);
+    if (name) {
+        snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "%s", name);
+    } else {
+        snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "---");
+    }
+}
+
 static void midi_fifo_push(virus_shm_t *shm, const uint8_t *msg, int len) {
     if (len < 1 || len > 8) return;
     if (midi_fifo_free(shm) < len + 1) return; /* drop if full */
@@ -300,10 +337,78 @@ static void child_send_midi(virusLib::Microcontroller *mc, const uint8_t *msg, i
     mc->sendMIDI(ev);
 }
 
+static bool child_use_mc_preset_map(virusLib::ROMFile *rom) {
+    return rom && rom->getModel() == virusLib::DeviceModel::A;
+}
+
+static int child_map_browser_bank_to_mc_bank(virusLib::ROMFile *rom, int bank) {
+    if (bank < 0) return bank;
+    if (!child_use_mc_preset_map(rom)) return bank;
+    /* Virus A MC single-bank table starts with 2 RAM banks, then ROM A..H.
+     * Browser bank 0..7 should map to ROM banks, not RAM mirror slots. */
+    return bank + 2;
+}
+
+static bool child_get_single_preset(virusLib::Microcontroller *mc,
+                                    virusLib::ROMFile *rom,
+                                    int bank,
+                                    int preset,
+                                    virusLib::ROMFile::TPreset *out) {
+    if (!out || bank < 0 || preset < 0) return false;
+
+    if (child_use_mc_preset_map(rom) && mc) {
+        const int mapped_bank = child_map_browser_bank_to_mc_bank(rom, bank);
+        if (mapped_bank < 0 || mapped_bank >= VIRUS_MAX_BANKS || preset >= VIRUS_MAX_PRESETS_PER_BANK)
+            return false;
+        return mc->requestSingle(virusLib::fromArrayIndex((uint8_t)mapped_bank), (uint8_t)preset, *out);
+    }
+
+    if (!rom) return false;
+    return rom->getSingle(bank, preset, *out);
+}
+
+static bool child_validate_virus_a_bank(virusLib::Microcontroller *mc,
+                                        virusLib::ROMFile *rom,
+                                        int bank,
+                                        int preset_count) {
+    if (!child_use_mc_preset_map(rom)) return true;
+    if (!mc || !rom || bank < 0 || preset_count <= 0) return false;
+
+    int p0 = 0;
+    int p1 = preset_count > 1 ? 1 : 0;
+    int plast = preset_count - 1;
+    const int probes[3] = {p0, p1, plast};
+
+    for (int i = 0; i < 3; ++i) {
+        int p = probes[i];
+        virusLib::ROMFile::TPreset pd{};
+        if (!child_get_single_preset(mc, rom, bank, p, &pd)) return false;
+
+        if (pd[2] != (uint8_t)bank) return false;
+        if (pd[3] != (uint8_t)p) return false;
+        if (virusLib::ROMFile::getSingleName(pd).size() != 10) return false;
+    }
+
+    return true;
+}
+
+static void child_build_preset_name_cache(virus_shm_t *shm,
+                                          virusLib::Microcontroller *mc,
+                                          virusLib::ROMFile *rom);
+static void child_update_preset_name(virus_shm_t *shm,
+                                     virusLib::Microcontroller *mc,
+                                     virusLib::ROMFile *rom);
+static int child_detect_valid_bank_count(virusLib::Microcontroller *mc,
+                                         virusLib::ROMFile *rom,
+                                         int fallback_bank_count);
+
 /* Process at most max_msgs MIDI messages per call.
  * Rate-limiting spreads note-on voice allocation across emu blocks,
  * preventing DSP cycle bursts that cause audio dropouts. */
-static void child_process_midi_fifo(virus_shm_t *shm, virusLib::Microcontroller *mc, int max_msgs = 2) {
+static void child_process_midi_fifo(virus_shm_t *shm,
+                                    virusLib::Microcontroller *mc,
+                                    virusLib::ROMFile *rom,
+                                    int max_msgs = 2) {
     int processed = 0;
     while (midi_fifo_available(shm) > 0 && processed < max_msgs) {
         int rd = shm->midi_read;
@@ -322,14 +427,115 @@ static void child_process_midi_fifo(virus_shm_t *shm, virusLib::Microcontroller 
         if (status == 0xB0 && len >= 3)
             shm->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
 
+        int bank = shm->current_bank;
+        int preset = shm->current_preset;
+        const int change_mask = apply_program_selection_midi(msg, len, shm->bank_count, shm->preset_count, &bank, &preset);
+        if (change_mask != PROGRAM_SELECTION_NONE) {
+            shm->current_bank = bank;
+            shm->current_preset = preset;
+            if ((change_mask & PROGRAM_SELECTION_BANK_CHANGED) != 0)
+                snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank %c", 'A' + bank);
+        }
+
+        const bool is_bank_select = (status == 0xB0 && len >= 3 && (msg[1] == 0 || msg[1] == 32));
+        const bool is_program_change = (status == 0xC0 && len >= 2);
+
+        if (is_program_change) {
+            /* Load from the same source we use for the browser cache so names
+             * and audible patch content stay in lockstep. */
+            virusLib::ROMFile::TPreset single{};
+            if (child_get_single_preset(mc, rom, shm->current_bank, shm->current_preset, &single)) {
+                mc->writeSingle(virusLib::BankNumber::EditBuffer, virusLib::SINGLE, single);
+            }
+            child_update_preset_name(shm, mc, rom);
+            processed++;
+            continue;
+        }
+
+        if (is_bank_select) {
+            /* Bank select is pending until Program Change commit. */
+            if ((change_mask & PROGRAM_SELECTION_BANK_CHANGED) != 0)
+                child_update_preset_name(shm, mc, rom);
+            processed++;
+            continue;
+        }
+
         child_send_midi(mc, msg, len);
+
+        if ((change_mask & (PROGRAM_SELECTION_BANK_CHANGED | PROGRAM_SELECTION_PRESET_CHANGED)) != 0) {
+            child_update_preset_name(shm, mc, rom);
+        }
+
         processed++;
     }
 }
 
-static void child_update_preset_name(virus_shm_t *shm, virusLib::ROMFile *rom) {
-    virusLib::ROMFile::TPreset pd;
-    if (rom->getSingle(shm->current_bank, shm->current_preset, pd))
+static int child_detect_valid_bank_count(virusLib::Microcontroller *mc,
+                                         virusLib::ROMFile *rom,
+                                         int fallback_bank_count) {
+    if (!rom) return fallback_bank_count > 0 ? fallback_bank_count : 1;
+
+    int preset_count = rom->getPresetsPerBank();
+    if (preset_count <= 0) preset_count = VIRUS_MAX_PRESETS_PER_BANK;
+    if (preset_count > VIRUS_MAX_PRESETS_PER_BANK) preset_count = VIRUS_MAX_PRESETS_PER_BANK;
+
+    int detected = 0;
+    virusLib::ROMFile::TPreset pd{};
+    for (int bank = 0; bank < VIRUS_MAX_BANKS; ++bank) {
+        if (!child_get_single_preset(mc, rom, bank, 0, &pd)) break;
+
+        if (child_use_mc_preset_map(rom)) {
+            if (!child_validate_virus_a_bank(mc, rom, bank, preset_count)) break;
+        }
+
+        detected++;
+    }
+
+    if (detected > 0) return detected;
+    return fallback_bank_count > 0 ? fallback_bank_count : 1;
+}
+
+static void child_build_preset_name_cache(virus_shm_t *shm,
+                                          virusLib::Microcontroller *mc,
+                                          virusLib::ROMFile *rom) {
+    if (!shm) return;
+    shm->preset_name_cache_ready = 0;
+    memset((void*)shm->preset_name_cache, 0, sizeof(shm->preset_name_cache));
+    if (!rom || !mc) return;
+
+    int bank_count = shm->bank_count;
+    if (bank_count < 0) bank_count = 0;
+    if (bank_count > VIRUS_MAX_BANKS) bank_count = VIRUS_MAX_BANKS;
+    int preset_count = shm->preset_count;
+    if (preset_count < 0) preset_count = 0;
+    if (preset_count > VIRUS_MAX_PRESETS_PER_BANK) preset_count = VIRUS_MAX_PRESETS_PER_BANK;
+
+    virusLib::ROMFile::TPreset pd{};
+    for (int bank = 0; bank < bank_count; ++bank) {
+        for (int preset = 0; preset < preset_count; ++preset) {
+            if (!child_get_single_preset(mc, rom, bank, preset, &pd)) continue;
+            const std::string name = virusLib::ROMFile::getSingleName(pd);
+            snprintf(shm->preset_name_cache[bank][preset],
+                     sizeof(shm->preset_name_cache[bank][preset]),
+                     "%s",
+                     name.empty() ? "---" : name.c_str());
+        }
+    }
+
+    shm->preset_name_cache_ready = 1;
+}
+
+static void child_update_preset_name(virus_shm_t *shm,
+                                     virusLib::Microcontroller *mc,
+                                     virusLib::ROMFile *rom) {
+    const char *cached = shm_lookup_preset_name(shm, shm->current_bank, shm->current_preset);
+    if (cached) {
+        snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "%s", cached);
+        return;
+    }
+
+    virusLib::ROMFile::TPreset pd{};
+    if (child_get_single_preset(mc, rom, shm->current_bank, shm->current_preset, &pd))
         snprintf((char*)shm->preset_name, sizeof(shm->preset_name), "%s",
                  virusLib::ROMFile::getSingleName(pd).c_str());
     else
@@ -360,8 +566,9 @@ static void child_main(virus_shm_t *shm) {
     signal(SIGBUS, child_crash_handler);
     signal(SIGABRT, child_crash_handler);
 
-    /* Close the vlog FILE from parent (we'll reopen) */
-    if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
+    /* After fork in a multithreaded process, avoid stdio teardown inherited
+     * from parent; just drop the pointer and reopen lazily in child. */
+    g_vlog = nullptr;
 
     vlog("[child] started, pid=%d", (int)getpid());
     fprintf(stderr, "Virus child: started pid=%d\n", (int)getpid());
@@ -388,7 +595,7 @@ static void child_main(virus_shm_t *shm) {
     shm->rom_count = (int)roms.size();
     if (shm->rom_count > 8) shm->rom_count = 8;
     for (int i = 0; i < shm->rom_count; i++) {
-        virusLib::ROMFile tmp(virusLib::ROMFile(roms[i]));
+        virusLib::ROMFile tmp{roms[i]};
         snprintf(shm->rom_names[i], sizeof(shm->rom_names[i]), "Virus %s",
                  tmp.getModelName().c_str());
         vlog("[child] ROM[%d]: %s", i, shm->rom_names[i]);
@@ -506,18 +713,27 @@ static void child_main(virus_shm_t *shm) {
     strncpy((char*)shm->rom_model_name, rom->getModelName().c_str(), sizeof(shm->rom_model_name) - 1);
 
     /* 8. Set up presets */
-    shm->bank_count = virusLib::ROMFile::getRomBankCount(rom->getModel());
+    shm->bank_count = child_detect_valid_bank_count(
+        mc, rom, (int)virusLib::ROMFile::getRomBankCount(rom->getModel()));
     shm->preset_count = rom->getPresetsPerBank();
     shm->current_bank = 0;
     shm->current_preset = 0;
     snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank A");
-    child_update_preset_name(shm, rom);
+    child_build_preset_name_cache(shm, mc, rom);
+    child_update_preset_name(shm, mc, rom);
 
-    { /* Initial preset via MIDI */
-        synthLib::SMidiEvent bankSel(synthLib::MidiEventSource::Host, 0xB0, 0, 0);
-        mc->sendMIDI(bankSel);
-        synthLib::SMidiEvent progChg(synthLib::MidiEventSource::Host, 0xC0, 0, 0);
-        mc->sendMIDI(progChg);
+    { /* Initial preset */
+        if (child_use_mc_preset_map(rom)) {
+            virusLib::ROMFile::TPreset single{};
+            if (child_get_single_preset(mc, rom, shm->current_bank, shm->current_preset, &single))
+                mc->writeSingle(virusLib::BankNumber::EditBuffer, virusLib::SINGLE, single);
+        } else {
+            synthLib::SMidiEvent bankSel(synthLib::MidiEventSource::Host, 0xB0, 32,
+                                         bank_index_to_midi_lsb(shm->current_bank, shm->bank_count));
+            mc->sendMIDI(bankSel);
+            synthLib::SMidiEvent progChg(synthLib::MidiEventSource::Host, 0xC0, 0, 0);
+            mc->sendMIDI(progChg);
+        }
     }
 
     /* 9. Pre-fill ring buffer */
@@ -564,7 +780,7 @@ static void child_main(virus_shm_t *shm) {
 
         while (!shm->child_shutdown) {
             /* Process incoming MIDI from parent */
-            child_process_midi_fifo(shm, mc);
+            child_process_midi_fifo(shm, mc, rom);
 
             /* Throttle: don't let ring fill beyond target (keeps latency low) */
             if (shm_ring_available(shm) >= RING_TARGET_FILL) {
@@ -690,7 +906,7 @@ static int fork_and_wait_child(virus_instance_t *inst) {
 
     if (pid == 0) {
         /* === CHILD PROCESS === */
-        if (g_vlog) { fclose(g_vlog); g_vlog = nullptr; }
+        g_vlog = nullptr;
         child_main(shm);
         _exit(0);
     }
@@ -917,14 +1133,20 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             return;
         }
         int ival;
+        bool has_preset = false;
+        int preset_from_state = 0;
         if (json_get_int(val, "bank", &ival) == 0 && ival >= 0 && ival < shm->bank_count) {
             shm->current_bank = ival;
             snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank %c", 'A' + ival);
         }
         if (json_get_int(val, "preset", &ival) == 0 && ival >= 0 && ival < shm->preset_count) {
-            shm->current_preset = ival;
-            uint8_t cc0[3] = { 0xB0, 0, (uint8_t)shm->current_bank };
-            midi_fifo_push(shm, cc0, 3);
+            has_preset = true;
+            preset_from_state = ival;
+        }
+        if (has_preset) {
+            shm->current_preset = preset_from_state;
+            uint8_t cc32[3] = { 0xB0, 32, bank_index_to_midi_lsb(shm->current_bank, shm->bank_count) };
+            midi_fifo_push(shm, cc32, 3);
             uint8_t pc[2] = { 0xC0, (uint8_t)shm->current_preset };
             midi_fifo_push(shm, pc, 2);
         }
@@ -959,29 +1181,38 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 midi_fifo_push(shm, cc, 3);
             }
         }
+        shm_refresh_current_preset_name(shm);
         return;
     }
     if (strcmp(key, "preset") == 0) {
         int idx = atoi(val);
         if (idx >= 0 && idx < shm->preset_count) {
+            if (idx == shm->current_preset) {
+                shm_refresh_current_preset_name(shm);
+                return;
+            }
             shm->current_preset = idx;
-            uint8_t cc0[3] = { 0xB0, 0, (uint8_t)shm->current_bank };
-            midi_fifo_push(shm, cc0, 3);
             uint8_t pc[2] = { 0xC0, (uint8_t)idx };
             midi_fifo_push(shm, pc, 2);
+            shm_refresh_current_preset_name(shm);
         }
         return;
     }
     if (strcmp(key, "bank_index") == 0) {
         int idx = atoi(val);
         if (idx >= 0 && idx < shm->bank_count) {
+            if (idx == shm->current_bank) {
+                shm_refresh_current_preset_name(shm);
+                return;
+            }
             shm->current_bank = idx;
             shm->current_preset = 0;
             snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank %c", 'A' + idx);
-            uint8_t cc0[3] = { 0xB0, 0, (uint8_t)idx };
-            midi_fifo_push(shm, cc0, 3);
+            uint8_t cc32[3] = { 0xB0, 32, bank_index_to_midi_lsb(idx, shm->bank_count) };
+            midi_fifo_push(shm, cc32, 3);
             uint8_t pc[2] = { 0xC0, 0 };
             midi_fifo_push(shm, pc, 2);
+            shm_refresh_current_preset_name(shm);
         }
         return;
     }
@@ -1049,7 +1280,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
 
     if (strcmp(key, "preset") == 0) return snprintf(buf, buf_len, "%d", shm->current_preset);
     if (strcmp(key, "preset_count") == 0) return snprintf(buf, buf_len, "%d", shm->preset_count);
-    if (strcmp(key, "preset_name") == 0) return snprintf(buf, buf_len, "%s", (const char*)shm->preset_name);
+    if (strcmp(key, "preset_name") == 0) {
+        shm_refresh_current_preset_name(shm);
+        return snprintf(buf, buf_len, "%s", (const char*)shm->preset_name);
+    }
     if (strcmp(key, "name") == 0) return snprintf(buf, buf_len, "Virus");
     if (strcmp(key, "bank_index") == 0) return snprintf(buf, buf_len, "%d", shm->current_bank);
     if (strcmp(key, "bank_count") == 0) return snprintf(buf, buf_len, "%d", shm->bank_count);
@@ -1118,24 +1352,19 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return off;
     }
     if (strcmp(key, "ui_hierarchy") == 0) {
-        const char *h = "{\"modes\":null,\"levels\":{\"root\":{\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\",\"children\":null,"
-            "\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"flt_attack\",\"flt_decay\",\"flt_sustain\",\"flt_release\",\"octave_transpose\"],"
-            "\"params\":[{\"level\":\"filter\",\"label\":\"Filter\"},{\"level\":\"amp\",\"label\":\"Amp Env\"},{\"level\":\"osc\",\"label\":\"Oscillators\"},{\"level\":\"settings\",\"label\":\"Settings\"}]},"
-            "\"filter\":{\"children\":null,\"knobs\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_mode\"],\"params\":[\"cutoff\",\"resonance\",\"filter_env\",\"filter_mode\"]},"
-            "\"amp\":{\"children\":null,\"knobs\":[\"amp_attack\",\"amp_decay\",\"amp_sustain\",\"amp_release\"],\"params\":[\"amp_attack\",\"amp_decay\",\"amp_sustain\",\"amp_release\"]},"
-            "\"osc\":{\"children\":null,\"knobs\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"],\"params\":[\"osc1_shape\",\"osc2_shape\",\"osc_balance\",\"patch_volume\"]},"
-            "\"settings\":{\"children\":null,\"knobs\":[\"dsp_clock\",\"gain\"],"
-            "\"params\":[\"rom_index\",\"dsp_clock\",\"gain\"]}}}";
+        const char *h = R"JSON({"modes":null,"levels":{"root":{"list_param":"preset","count_param":"preset_count","name_param":"preset_name","children":null,"knobs":["cutoff","resonance","filter_env","flt_attack","flt_decay","flt_sustain","flt_release","octave_transpose"],"params":[{"key":"bank_index","label":"Bank"},{"level":"filter","label":"Filter"},{"level":"amp","label":"Amp Env"},{"level":"osc","label":"Oscillators"},{"level":"settings","label":"Settings"}]},"filter":{"children":null,"knobs":["cutoff","resonance","filter_env","filter_mode"],"params":[{"key":"cutoff","label":"Cutoff"},{"key":"resonance","label":"Resonance"},{"key":"filter_env","label":"Filter Env"},{"key":"filter_mode","label":"Filter Mode"}]},"amp":{"children":null,"knobs":["amp_attack","amp_decay","amp_sustain","amp_release"],"params":[{"key":"amp_attack","label":"Amp Attack"},{"key":"amp_decay","label":"Amp Decay"},{"key":"amp_sustain","label":"Amp Sustain"},{"key":"amp_release","label":"Amp Release"}]},"osc":{"children":null,"knobs":["osc1_shape","osc2_shape","osc_balance","patch_volume"],"params":[{"key":"osc1_shape","label":"Osc1 Shape"},{"key":"osc2_shape","label":"Osc2 Shape"},{"key":"osc_balance","label":"Osc Balance"},{"key":"patch_volume","label":"Volume"}]},"settings":{"children":null,"knobs":["dsp_clock","gain"],"params":[{"key":"rom_index","label":"ROM"},{"key":"dsp_clock","label":"DSP Clock"},{"key":"gain","label":"Gain"}]}}})JSON";
         int len = strlen(h);
         if (len < buf_len) { strcpy(buf, h); return len; }
         return -1;
     }
     if (strcmp(key, "chain_params") == 0) {
         int off = 0;
+        int bank_max = shm->bank_count > 0 ? shm->bank_count - 1 : 0;
         off += snprintf(buf+off, buf_len-off,
             "[{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"bank_index\",\"name\":\"Bank\",\"type\":\"int\",\"min\":0,\"max\":%d},"
             "{\"key\":\"octave_transpose\",\"name\":\"Octave\",\"type\":\"int\",\"min\":-4,\"max\":4},"
-            "{\"key\":\"rom_index\",\"name\":\"ROM\",\"type\":\"enum\",\"options\":[");
+            "{\"key\":\"rom_index\",\"name\":\"ROM\",\"type\":\"enum\",\"options\":[", bank_max);
         for (int i = 0; i < shm->rom_count; i++) {
             if (i > 0) off += snprintf(buf+off, buf_len-off, ",");
             off += snprintf(buf+off, buf_len-off, "\"%s\"", shm->rom_names[i]);

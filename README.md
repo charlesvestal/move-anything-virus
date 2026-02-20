@@ -52,7 +52,13 @@ Works as a sound generator in Move Everything's Signal Chain. Exposed parameters
 - Amp Envelope: Attack, Decay, Sustain, Release
 - Oscillators: Osc1 Shape, Osc2 Shape, Osc Balance, Volume
 
-Preset browsing via jog wheel (8 banks x 128 presets for ABC models).
+Preset browsing supports 8 banks x 128 presets.
+
+On-device controls:
+
+- **Jog wheel** or **Left/Right**: previous/next preset
+- **Shift + Left/Right**: previous/next bank
+- Scrolling past the first/last preset automatically wraps to the previous/next bank
 
 ## Building
 

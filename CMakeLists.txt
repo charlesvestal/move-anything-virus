@@ -51,6 +51,7 @@ add_subdirectory(${GEARMULATOR_SOURCE}/mqLib ${CMAKE_BINARY_DIR}/mqLib)
 
 add_library(virus-move-plugin SHARED
     src/dsp/virus_plugin.cpp
+    src/dsp/program_selection.cpp
 )
 
 target_include_directories(virus-move-plugin PRIVATE
