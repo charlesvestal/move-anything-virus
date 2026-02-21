@@ -2,7 +2,7 @@
     "id": "osirus",
     "name": "Osirus",
     "abbrev": "OS",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "description": "Access Virus DSP56300 emulator (Gearmulator)",
     "author": "dsp56300/gearmulator (port: charlesvestal)",
     "ui": "ui.js",
@@ -22,6 +22,7 @@
         "audio_in": false,
         "midi_in": true,
         "midi_out": false,
+        "default_forward_channel": 1,
         "chainable": true,
         "component_type": "sound_generator"
     }

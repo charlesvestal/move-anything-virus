@@ -100,6 +100,7 @@ typedef struct plugin_api_v2 {
 #define OUTPUT_GAIN         0.7f
 #define MIDI_FIFO_SIZE      4096  /* bytes */
 #define RING_TARGET_FILL    768   /* ~17ms at 44100 Hz — extra headroom for note-on bursts */
+#define VIRUS_STATE_VERSION 2
 
 static const host_api_v1_t *g_host = nullptr;
 
@@ -210,6 +211,7 @@ struct virus_shm_t {
     char preset_name_cache[VIRUS_MAX_BANKS][VIRUS_MAX_PRESETS_PER_BANK][VIRUS_PRESET_NAME_BYTES];
     volatile int octave_transpose;
     volatile int cc_values[128];
+    uint8_t cc_seen[128];
 
     /* Profiling */
     volatile int underrun_count;
@@ -261,6 +263,12 @@ static int midi_fifo_available(virus_shm_t *shm) {
 
 static int midi_fifo_free(virus_shm_t *shm) {
     return MIDI_FIFO_SIZE - 1 - midi_fifo_available(shm);
+}
+
+static void clear_param_overrides(virus_shm_t *shm) {
+    if (!shm) return;
+    for (int i = 0; i < NUM_PARAMS; i++)
+        shm->cc_seen[g_params[i].cc] = 0;
 }
 
 static uint8_t bank_index_to_midi_lsb(int bank_index, int bank_count) {
@@ -424,8 +432,10 @@ static void child_process_midi_fifo(virus_shm_t *shm,
 
         /* Track CC values in shared memory */
         uint8_t status = msg[0] & 0xF0;
-        if (status == 0xB0 && len >= 3)
+        if (status == 0xB0 && len >= 3) {
             shm->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
+            shm->cc_seen[msg[1] & 0x7F] = 1;
+        }
 
         int bank = shm->current_bank;
         int preset = shm->current_preset;
@@ -1102,8 +1112,16 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     }
 
     /* Track CC values locally too */
-    if (status == 0xB0 && len >= 3)
+    if (status == 0xB0 && len >= 3) {
         inst->shm->cc_values[msg[1] & 0x7F] = msg[2] & 0x7F;
+        inst->shm->cc_seen[msg[1] & 0x7F] = 1;
+    }
+
+    if (status == 0xC0 && len >= 2) {
+        clear_param_overrides(inst->shm);
+    } else if (status == 0xB0 && len >= 3 && (msg[1] == 0 || msg[1] == 32)) {
+        clear_param_overrides(inst->shm);
+    }
 
     /* Push to shared MIDI FIFO for child to consume */
     midi_fifo_push(inst->shm, modified, n);
@@ -1133,6 +1151,9 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             return;
         }
         int ival;
+        int state_version = 1;
+        if (json_get_int(val, "state_version", &ival) == 0)
+            state_version = ival;
         bool has_preset = false;
         int preset_from_state = 0;
         if (json_get_int(val, "bank", &ival) == 0 && ival >= 0 && ival < shm->bank_count) {
@@ -1144,6 +1165,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             preset_from_state = ival;
         }
         if (has_preset) {
+            clear_param_overrides(shm);
             shm->current_preset = preset_from_state;
             uint8_t cc32[3] = { 0xB0, 32, bank_index_to_midi_lsb(shm->current_bank, shm->bank_count) };
             midi_fifo_push(shm, cc32, 3);
@@ -1173,13 +1195,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (ival < 1) ival = 1; if (ival > 100) ival = 100;
             shm->gain_percent = ival;
         }
-        for (int i = 0; i < NUM_PARAMS; i++) {
-            if (json_get_int(val, g_params[i].key, &ival) == 0) {
-                if (ival < g_params[i].min_val) ival = g_params[i].min_val;
-                if (ival > g_params[i].max_val) ival = g_params[i].max_val;
-                uint8_t cc[3] = { 0xB0, (uint8_t)g_params[i].cc, (uint8_t)ival };
-                midi_fifo_push(shm, cc, 3);
+        if (state_version >= VIRUS_STATE_VERSION) {
+            for (int i = 0; i < NUM_PARAMS; i++) {
+                if (json_get_int(val, g_params[i].key, &ival) == 0) {
+                    if (ival < g_params[i].min_val) ival = g_params[i].min_val;
+                    if (ival > g_params[i].max_val) ival = g_params[i].max_val;
+                    shm->cc_values[g_params[i].cc] = ival;
+                    shm->cc_seen[g_params[i].cc] = 1;
+                    uint8_t cc[3] = { 0xB0, (uint8_t)g_params[i].cc, (uint8_t)ival };
+                    midi_fifo_push(shm, cc, 3);
+                }
             }
+        } else {
+            vlog("[parent] legacy state detected; skipping per-parameter restore");
         }
         shm_refresh_current_preset_name(shm);
         return;
@@ -1191,6 +1219,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 shm_refresh_current_preset_name(shm);
                 return;
             }
+            clear_param_overrides(shm);
             shm->current_preset = idx;
             uint8_t pc[2] = { 0xC0, (uint8_t)idx };
             midi_fifo_push(shm, pc, 2);
@@ -1205,6 +1234,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 shm_refresh_current_preset_name(shm);
                 return;
             }
+            clear_param_overrides(shm);
             shm->current_bank = idx;
             shm->current_preset = 0;
             snprintf((char*)shm->bank_name, sizeof(shm->bank_name), "Bank %c", 'A' + idx);
@@ -1266,6 +1296,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             int ival = atoi(val);
             if (ival < g_params[i].min_val) ival = g_params[i].min_val;
             if (ival > g_params[i].max_val) ival = g_params[i].max_val;
+            shm->cc_values[g_params[i].cc] = ival;
+            shm->cc_seen[g_params[i].cc] = 1;
             uint8_t cc[3] = { 0xB0, (uint8_t)g_params[i].cc, (uint8_t)ival };
             midi_fifo_push(shm, cc, 3);
             return;
@@ -1341,13 +1373,15 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
 
     if (strcmp(key, "state") == 0) {
         int off = 0;
-        off += snprintf(buf+off, buf_len-off, "{\"bank\":%d,\"preset\":%d,\"octave_transpose\":%d",
-            shm->current_bank, shm->current_preset, shm->octave_transpose);
+        off += snprintf(buf+off, buf_len-off, "{\"state_version\":%d,\"bank\":%d,\"preset\":%d,\"octave_transpose\":%d",
+            VIRUS_STATE_VERSION, shm->current_bank, shm->current_preset, shm->octave_transpose);
         off += snprintf(buf+off, buf_len-off, ",\"dsp_clock\":%d,\"gain\":%d,\"rom_index\":%d",
             shm->dsp_clock_applied > 0 ? shm->dsp_clock_applied : 40,
             shm->gain_percent > 0 ? shm->gain_percent : 70, shm->rom_index);
-        for (int i = 0; i < NUM_PARAMS; i++)
+        for (int i = 0; i < NUM_PARAMS; i++) {
+            if (!shm->cc_seen[g_params[i].cc]) continue;
             off += snprintf(buf+off, buf_len-off, ",\"%s\":%d", g_params[i].key, shm->cc_values[g_params[i].cc]);
+        }
         off += snprintf(buf+off, buf_len-off, "}");
         return off;
     }
