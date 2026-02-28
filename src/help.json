@@ -1,0 +1,136 @@
+{
+  "title": "Osirus",
+  "children": [
+    {
+      "title": "Overview",
+      "lines": [
+        "Access Virus DSP",
+        "emulator powered by",
+        "Gearmulator.",
+        "",
+        "Requires Virus ROM",
+        "files (.mid or .BIN)",
+        "in the roms/ folder.",
+        "",
+        "Supports Virus A,",
+        "B, and C ROMs.",
+        "",
+        "128 presets per bank,",
+        "up to 32 banks."
+      ]
+    },
+    {
+      "title": "Setup",
+      "lines": [
+        "Upload Virus ROM",
+        "files to the roms/",
+        "folder via the ME",
+        "Installer's asset",
+        "copy feature.",
+        "",
+        "Supported formats:",
+        " .mid (SysEx dump)",
+        " .BIN (raw ROM)",
+        "",
+        "Virus A ROMs run at",
+        "full DSP clock.",
+        "Virus B/C ROMs run",
+        "at reduced clock",
+        "(50% of A)."
+      ]
+    },
+    {
+      "title": "Controls",
+      "children": [
+        {
+          "title": "Knob Mapping",
+          "lines": [
+            "Knob 1: Cutoff",
+            "Knob 2: Resonance",
+            "Knob 3: Filter Env",
+            "Knob 4: Flt Attack",
+            "Knob 5: Flt Decay",
+            "Knob 6: Flt Sustain",
+            "Knob 7: Flt Release",
+            "Knob 8: Octave",
+            " (-4 to +4)"
+          ]
+        },
+        {
+          "title": "Filter",
+          "lines": [
+            "Cutoff: 0-127",
+            "Resonance: 0-127",
+            "Filter Env Amt:",
+            " 0-127",
+            "Filter Mode:",
+            " 8 types (0-7)",
+            "",
+            "Filter envelope",
+            "shapes cutoff over",
+            "time with A/D/S/R",
+            "controls."
+          ]
+        },
+        {
+          "title": "Amp Envelope",
+          "lines": [
+            "Attack: 0-127",
+            "Decay: 0-127",
+            "Sustain: 0-127",
+            "Release: 0-127",
+            "",
+            "Controls amplitude",
+            "shape of each note."
+          ]
+        },
+        {
+          "title": "Oscillators",
+          "lines": [
+            "Osc 1 Shape: 0-127",
+            "Osc 2 Shape: 0-127",
+            "Osc Balance: 0-127",
+            "Volume: 0-127",
+            "",
+            "Shapes and balance",
+            "between the two",
+            "oscillators."
+          ]
+        },
+        {
+          "title": "Settings",
+          "lines": [
+            "ROM: select which",
+            " Virus ROM to use",
+            "",
+            "DSP Clock %: 10-100",
+            " CPU clock speed",
+            " Lower = less CPU",
+            " but reduced quality",
+            "",
+            "Gain %: 1-100",
+            " Output level"
+          ]
+        }
+      ]
+    },
+    {
+      "title": "MIDI",
+      "lines": [
+        "Receives notes,",
+        "CCs, pitch bend,",
+        "and program changes.",
+        "",
+        "Octave Transpose:",
+        " -4 to +4 octaves",
+        "",
+        "Bank Select:",
+        " CC 0 / CC 32",
+        "",
+        "Program Change:",
+        " Selects preset",
+        " (0-127 per bank)"
+      ]
+    }
+  ]
+}
